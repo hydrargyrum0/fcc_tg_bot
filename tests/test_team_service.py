@@ -1,4 +1,5 @@
 import pytest
+from sqlalchemy.exc import IntegrityError
 from services.user_service import UserService
 from services.team_service import TeamService
 from db.models.user import UserRole
@@ -25,7 +26,7 @@ async def test_create_team_duplicate_name_raises(session):
     team_svc = TeamService(session)
     await team_svc.create_team("Alpha", admin.id)
 
-    with pytest.raises(Exception):
+    with pytest.raises(IntegrityError):
         await team_svc.create_team("Alpha", admin.id)
 
 
@@ -108,3 +109,33 @@ async def test_list_teams(session):
 
     teams = await team_svc.list_teams()
     assert len(teams) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_team_by_id(session):
+    user_svc = UserService(session)
+    admin, _ = await user_svc.get_or_create(1, "admin", "Admin", UserRole.superadmin)
+
+    team_svc = TeamService(session)
+    team = await team_svc.create_team("Alpha", admin.id)
+
+    found = await team_svc.get_team_by_id(team.id)
+    assert found is not None
+    assert found.name == "Alpha"
+
+    missing = await team_svc.get_team_by_id(9999)
+    assert missing is None
+
+
+@pytest.mark.asyncio
+async def test_add_member_duplicate_raises(session):
+    user_svc = UserService(session)
+    admin, _ = await user_svc.get_or_create(1, "admin", "Admin", UserRole.superadmin)
+    member, _ = await user_svc.get_or_create(2, "alice", "Alice", UserRole.member)
+
+    team_svc = TeamService(session)
+    team = await team_svc.create_team("Alpha", admin.id)
+    await team_svc.add_member(team.id, member.id)
+
+    with pytest.raises(IntegrityError):
+        await team_svc.add_member(team.id, member.id)
