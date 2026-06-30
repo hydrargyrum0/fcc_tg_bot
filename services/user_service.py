@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from db.models.user import User, UserRole
 
@@ -22,7 +23,12 @@ class UserService:
         user = await self.get_by_id(user_id)
         if user:
             return user, False
-        user = User(id=user_id, username=username, full_name=full_name, role=role)
-        self.session.add(user)
-        await self.session.commit()
-        return user, True
+        try:
+            user = User(id=user_id, username=username, full_name=full_name, role=role)
+            self.session.add(user)
+            await self.session.commit()
+            return user, True
+        except IntegrityError:
+            await self.session.rollback()
+            user = await self.get_by_id(user_id)
+            return user, False

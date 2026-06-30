@@ -41,3 +41,18 @@ async def test_get_by_id_returns_user(session):
     user = await svc.get_by_id(222)
     assert user is not None
     assert user.role == UserRole.superadmin
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_handles_integrity_error(session):
+    from sqlalchemy import text
+    await session.execute(
+        text("INSERT INTO users (id, username, full_name, role) VALUES (:id, :username, :full_name, :role)"),
+        {"id": 333, "username": "dave", "full_name": "Dave", "role": "member"},
+    )
+    await session.commit()
+
+    svc = UserService(session)
+    user, created = await svc.get_or_create(333, "dave", "Dave", UserRole.member)
+    assert created is False
+    assert user.id == 333
