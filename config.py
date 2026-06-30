@@ -10,7 +10,7 @@ class Settings(BaseSettings):
 
     @field_validator("superadmin_ids", mode="before")
     @classmethod
-    def parse_ids(cls, v):
+    def parse_ids(cls, v: str | list) -> list[int]:
         if isinstance(v, str):
             return [int(i.strip()) for i in v.split(",") if i.strip()]
         if isinstance(v, int):
