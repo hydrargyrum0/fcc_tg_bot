@@ -2,6 +2,9 @@ services:
   bot:
     build: .
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://fcc:fcc_pass@postgres:5432/fcc_bot
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres:
         condition: service_healthy
@@ -11,6 +14,8 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-fcc_bot}
       POSTGRES_USER: ${POSTGRES_USER:-fcc}
@@ -25,6 +30,8 @@ services:
 
   redis:
     image: redis:7-alpine
+    ports:
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

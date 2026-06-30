@@ -11,6 +11,7 @@ from db.models.base import Base
 from db.models.user import User  # noqa: F401 — ensures model is registered
 from db.models.team import Team  # noqa: F401
 from db.models.team_member import TeamMember  # noqa: F401
+from db.models.remnawave_panel import RemnaWavePanel  # noqa: F401
 from config import settings
 
 config = context.config

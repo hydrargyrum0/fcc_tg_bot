@@ -4,7 +4,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.redis import RedisStorage
 
-from bot.handlers import common, superadmin, member
+from bot.handlers import common, superadmin, member, remnawave_fsm
 from bot.middlewares.db import DbSessionMiddleware
 from bot.middlewares.role import RoleMiddleware
 from config import settings
@@ -21,6 +21,7 @@ async def main() -> None:
     dp.update.outer_middleware(DbSessionMiddleware(session_factory=async_session_factory))
     dp.update.outer_middleware(RoleMiddleware(superadmin_ids=settings.superadmin_ids))
 
+    dp.include_router(remnawave_fsm.router)
     dp.include_router(common.router)
     dp.include_router(superadmin.router)
     dp.include_router(member.router)
