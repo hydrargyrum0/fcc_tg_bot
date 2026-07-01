@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Enum, String, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.models.base import Base
@@ -20,3 +20,5 @@ class User(Base):
     full_name: Mapped[str] = mapped_column(String(256))
     role: Mapped[UserRole] = mapped_column(Enum(UserRole, native_enum=False))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    active_org_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=None)
+    notified_no_access: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false", default=False)

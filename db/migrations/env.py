@@ -12,6 +12,10 @@ from db.models.user import User  # noqa: F401 — ensures model is registered
 from db.models.team import Team  # noqa: F401
 from db.models.team_member import TeamMember  # noqa: F401
 from db.models.remnawave_panel import RemnaWavePanel  # noqa: F401
+from db.models.cloudflare_settings import CloudflareSettings  # noqa: F401
+from db.models.aws_account import AWSAccount  # noqa: F401
+from db.models.organization import Organization  # noqa: F401
+from db.models.organization_member import OrganizationMember  # noqa: F401
 from config import settings
 
 config = context.config

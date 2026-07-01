@@ -3,7 +3,7 @@ services:
     build: .
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://fcc:fcc_pass@postgres:5432/fcc_bot
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fcc}:${POSTGRES_PASSWORD:-fcc_pass}@postgres:5432/${POSTGRES_DB:-fcc_bot}
       REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres:
@@ -14,8 +14,6 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    ports:
-      - "5432:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-fcc_bot}
       POSTGRES_USER: ${POSTGRES_USER:-fcc}
@@ -23,20 +21,23 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fcc -d fcc_bot"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fcc} -d ${POSTGRES_DB:-fcc_bot}"]
       interval: 10s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
 volumes:
   pgdata:
+  redisdata:

@@ -1,6 +1,6 @@
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.user import User, UserRole
 
@@ -22,6 +22,10 @@ class UserService:
     ) -> tuple[User, bool]:
         user = await self.get_by_id(user_id)
         if user:
+            if user.username != username or user.full_name != full_name:
+                user.username = username
+                user.full_name = full_name
+                await self.session.commit()
             return user, False
         try:
             user = User(id=user_id, username=username, full_name=full_name, role=role)
@@ -32,3 +36,15 @@ class UserService:
             await self.session.rollback()
             user = await self.get_by_id(user_id)
             return user, False
+
+    async def set_active_org(self, user_id: int, org_id: int | None) -> None:
+        await self.session.execute(
+            update(User).where(User.id == user_id).values(active_org_id=org_id)
+        )
+        await self.session.commit()
+
+    async def mark_notified_no_access(self, user_id: int) -> None:
+        await self.session.execute(
+            update(User).where(User.id == user_id).values(notified_no_access=True)
+        )
+        await self.session.commit()
