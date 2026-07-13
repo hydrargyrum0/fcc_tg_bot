@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import base64
 import shlex
@@ -38,8 +39,11 @@ services:
       - /opt/certbot/certs:/etc/letsencrypt:ro
 """
 
+_CRON_LINE = "0 0 28 * * cd /opt/certbot && docker compose run --rm certbot renew"
 
-def _build_certbot_script(
+
+
+def _build_hysteria_deploy_script(
     domain: str, letsencrypt_email: str, node_secret: str, node_port: int
 ) -> str:
     certbot_compose_b64 = base64.b64encode(_CERTBOT_COMPOSE.encode()).decode()
@@ -63,22 +67,28 @@ def _build_certbot_script(
         f" -d {domain_q}"
     )
 
+    cron_cmd = f'(crontab -l 2>/dev/null | grep -v "certbot renew"; echo "{_CRON_LINE}") | crontab -'
+
     return "\n".join([
         "set -e",
+        # Install Docker if needed
         "command -v docker >/dev/null 2>&1 || (apt-get update -y && curl -fsSL https://get.docker.com | sh)",
         # Certbot setup
         "mkdir -p /opt/certbot/certs /opt/certbot/var-lib-letsencrypt",
         f"printf '%s' '{certbot_compose_b64}' | base64 -d > /opt/certbot/docker-compose.yml",
-        # Get certificate (standalone mode — port 80 must be free)
+        # Get SSL certificate (standalone mode — port 80 must be free)
         certbot_cmd,
-        # Update remnanode docker-compose to mount the certs volume
+        # Write remnanode compose with certs volume
+        "mkdir -p /opt/remnanode",
         f"printf '%s' '{remnanode_compose_b64}' | base64 -d > /opt/remnanode/docker-compose.yml",
-        # Restart remnanode with the new compose
-        "cd /opt/remnanode && docker compose down && docker compose up -d",
+        # Start/restart remnanode
+        "cd /opt/remnanode && docker compose down 2>/dev/null || true && docker compose pull && docker compose up -d",
+        # Add monthly cron for cert renewal (idempotent)
+        cron_cmd,
     ])
 
 
-async def setup_domain_cert(
+async def deploy_remnanode_hysteria(
     *,
     ip: str,
     login: str,
@@ -104,7 +114,7 @@ async def setup_domain_cert(
     async with asyncssh.connect(**connect_kwargs) as conn:
         await progress_cb("🔌 Подключено. Получаю SSL-сертификат...")
 
-        script = _build_certbot_script(domain, letsencrypt_email, node_secret, node_port)
+        script = _build_hysteria_deploy_script(domain, letsencrypt_email, node_secret, node_port)
         sudo_cmd = f"sudo -S -p '' bash -c {shlex.quote(script)}"
 
         start = asyncio.get_event_loop().time()
@@ -114,7 +124,7 @@ async def setup_domain_cert(
                 await asyncio.sleep(15)
                 elapsed = int(asyncio.get_event_loop().time() - start)
                 m, s = divmod(elapsed, 60)
-                await progress_cb(f"⚙️ Получаю сертификат... {m}м {s}с")
+                await progress_cb(f"⚙️ Устанавливаю... {m}м {s}с")
 
         ticker = asyncio.create_task(_ticker())
         try:
@@ -130,3 +140,7 @@ async def setup_domain_cert(
                 await ticker
             except asyncio.CancelledError:
                 pass
+
+
+# Legacy alias — used by node_domain_fsm for binding domain to existing nodes
+setup_domain_cert = deploy_remnanode_hysteria

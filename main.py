@@ -10,6 +10,8 @@ from bot.handlers import (
     cloudflare_fsm,
     common,
     deploy,
+    domains_fsm,
+    hosts_fsm,
     member,
     monitoring,
     node_domain_fsm,
@@ -39,6 +41,8 @@ async def main() -> None:
     dp.update.outer_middleware(RedisMiddleware(redis=redis))
 
     dp.include_router(org_select.router)
+    dp.include_router(hosts_fsm.router)
+    dp.include_router(domains_fsm.router)
     dp.include_router(remnawave_fsm.router)
     dp.include_router(cloudflare_fsm.router)
     dp.include_router(aws_fsm.router)

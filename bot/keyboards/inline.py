@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
@@ -8,8 +10,11 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🖥 Ноды", callback_data="menu:nodes"),
         ],
         [
-            InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings"),
+            InlineKeyboardButton(text="📡 Хосты", callback_data="menu:hosts"),
             InlineKeyboardButton(text="🌐 Домены", callback_data="menu:domains"),
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings"),
         ],
         [
             InlineKeyboardButton(text="🔄 Сменить организацию", callback_data="org:switch"),
@@ -198,6 +203,7 @@ def nodes_restart_confirm_kb(panel_id: int, node_uuid: str, force: str) -> Inlin
 def deploy_presets_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Стабильный Remnanode", callback_data="deploy:preset:remnanode_stable")],
+        [InlineKeyboardButton(text="Remnanode + Hysteria + TLS", callback_data="deploy:preset:remnanode_hysteria_tls")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
     ])
 
@@ -270,4 +276,111 @@ def aws_detail_kb(account_id: int) -> InlineKeyboardMarkup:
 def cancel_aws_edit_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="aws:cancel_edit")],
+    ])
+
+
+# ── Hosts ──────────────────────────────────────────────────────────────────────
+
+def hosts_panels_kb(panels: list) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=p.tag, callback_data=f"hosts:panel:{p.id}")]
+        for p in panels
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def hosts_tags_kb(tags: list[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=tag, callback_data=f"hosts:tag:{i}")]
+        for i, tag in enumerate(tags)
+    ]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="hosts:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def hosts_cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="hosts:cancel")],
+    ])
+
+
+# ── Domains ────────────────────────────────────────────────────────────────────
+
+_DOM_PAGE = 7
+
+
+def domains_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Отобразить список", callback_data="dom:list:0")],
+        [InlineKeyboardButton(text="🔍 Найти вручную", callback_data="dom:manual")],
+        [InlineKeyboardButton(text="🔽 Назад", callback_data="menu:back")],
+    ])
+
+
+def _dom_pagination(prev_cb: str, page: int, next_cb: str) -> list[InlineKeyboardButton]:
+    return [
+        InlineKeyboardButton(text="◀️", callback_data=prev_cb),
+        InlineKeyboardButton(text=str(page + 1), callback_data="dom:noop"),
+        InlineKeyboardButton(text="▶️", callback_data=next_cb),
+    ]
+
+
+def domains_zones_kb(zones: list, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=z["name"], callback_data=f"dom:zone:{z['id']}:0")]
+        for z in zones
+    ]
+    if total_pages > 1:
+        prev_cb = f"dom:list:{page - 1}" if page > 0 else "dom:noop"
+        next_cb = f"dom:list:{page + 1}" if page < total_pages - 1 else "dom:noop"
+        rows.append(_dom_pagination(prev_cb, page, next_cb))
+    rows.append([InlineKeyboardButton(text="🔽 Назад", callback_data="menu:domains")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def domains_records_kb(records: list, zone_id: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    offset = page * _DOM_PAGE
+    rows = []
+    for i, rec in enumerate(records):
+        ridx = offset + i
+        name = rec["name"]
+        if len(name) > 32:
+            name = name[:29] + "..."
+        rows.append([InlineKeyboardButton(
+            text=f"{rec['type']} {name}",
+            callback_data=f"dom:rec:{zone_id}:{ridx}",
+        )])
+    rows.append([InlineKeyboardButton(text="➕ Добавить A-запись", callback_data=f"dom:adda:{zone_id}")])
+    if total_pages > 1:
+        prev_cb = f"dom:zone:{zone_id}:{page - 1}" if page > 0 else "dom:noop"
+        next_cb = f"dom:zone:{zone_id}:{page + 1}" if page < total_pages - 1 else "dom:noop"
+        rows.append(_dom_pagination(prev_cb, page, next_cb))
+    rows.append([InlineKeyboardButton(text="🔽 Назад", callback_data="menu:domains")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def domains_record_detail_kb(zone_id: str, ridx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"dom:edit:{zone_id}:{ridx}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"dom:del:{zone_id}:{ridx}"),
+        ],
+        [InlineKeyboardButton(text="🔽 Назад", callback_data=f"dom:zone:{zone_id}:0")],
+    ])
+
+
+def domains_delete_confirm_kb(zone_id: str, ridx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Удалить", callback_data=f"dom:delok:{zone_id}:{ridx}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"dom:rec:{zone_id}:{ridx}"),
+        ],
+    ])
+
+
+def domains_cancel_kb(zone_id: str | None = None) -> InlineKeyboardMarkup:
+    cb = f"dom:cancel:{zone_id}" if zone_id else "dom:cancel"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=cb)],
     ])

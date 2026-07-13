@@ -1,3 +1,4 @@
+from __future__ import annotations
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession

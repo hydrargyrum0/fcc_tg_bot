@@ -1,3 +1,4 @@
+from __future__ import annotations
 import aiohttp
 
 CF_BASE = "https://api.cloudflare.com/client/v4"
@@ -53,8 +54,8 @@ async def find_zone(email: str, api_key: str, full_domain: str) -> tuple[str, st
     Returns (zone_id, root_domain) or None if not found.
     """
     parts = full_domain.split(".")
-    # Try from "skip 1 label" up to "only last 2 labels"
-    for i in range(len(parts) - 1, 1, -1):
+    # Try input itself first, then strip leftmost labels until 2 remain
+    for i in range(len(parts), 1, -1):
         candidate = ".".join(parts[-i:])
         zone_id = await _get_zone_id(email, api_key, candidate)
         if zone_id:
@@ -102,3 +103,53 @@ async def delete_a_record(email: str, api_key: str, zone_id: str, record_id: str
         f"{CF_BASE}/zones/{zone_id}/dns_records/{record_id}",
         _headers(email, api_key),
     )
+
+
+async def get_zone(email: str, api_key: str, zone_id: str) -> dict | None:
+    """Returns zone details {id, name, ...} or None."""
+    data = await _request(
+        "GET",
+        f"{CF_BASE}/zones/{zone_id}",
+        _headers(email, api_key),
+    )
+    return data.get("result")
+
+
+async def list_zones(email: str, api_key: str) -> list[dict]:
+    """Returns all active zones in the account sorted by name."""
+    all_zones: list[dict] = []
+    page = 1
+    while True:
+        data = await _request(
+            "GET",
+            f"{CF_BASE}/zones",
+            _headers(email, api_key),
+            params={"per_page": 50, "status": "active", "page": page},
+        )
+        result = data.get("result", [])
+        all_zones.extend(result)
+        info = data.get("result_info", {})
+        if len(all_zones) >= info.get("total_count", len(all_zones)):
+            break
+        page += 1
+    return sorted(all_zones, key=lambda z: z["name"])
+
+
+async def list_dns_records(email: str, api_key: str, zone_id: str) -> list[dict]:
+    """Returns all DNS records for a zone sorted by type then name."""
+    all_records: list[dict] = []
+    page = 1
+    while True:
+        data = await _request(
+            "GET",
+            f"{CF_BASE}/zones/{zone_id}/dns_records",
+            _headers(email, api_key),
+            params={"per_page": 100, "page": page},
+        )
+        result = data.get("result", [])
+        all_records.extend(result)
+        info = data.get("result_info", {})
+        if len(all_records) >= info.get("total_count", len(all_records)):
+            break
+        page += 1
+    return sorted(all_records, key=lambda r: (r["type"], r["name"]))

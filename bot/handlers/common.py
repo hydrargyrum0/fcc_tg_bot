@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 
 from aiogram import F, Router
@@ -92,12 +93,6 @@ async def nodes_cb(call: CallbackQuery, active_org: Organization, session: Async
 async def settings_cb(call: CallbackQuery) -> None:
     await call.answer()
     await call.message.edit_text("⚙️ Настройки", reply_markup=settings_kb())
-
-
-@router.callback_query(F.data == "menu:domains")
-async def domains_cb(call: CallbackQuery) -> None:
-    await call.answer()
-    await call.message.edit_text("🌐 Домены — в разработке", reply_markup=main_menu_kb())
 
 
 # --- Settings: Remnawave ---
