@@ -117,8 +117,8 @@ async def get_hosts(panel_url: str, api_token: str) -> list[dict]:
 
 
 async def update_host_address(panel_url: str, api_token: str, host_uuid: str, address: str) -> None:
-    """Updates the address field of a single host."""
-    await _patch(f"{panel_url}/api/hosts/{host_uuid}", api_token, {"address": address})
+    """Updates the address field of a single host. uuid goes in body, not URL."""
+    await _patch(f"{panel_url}/api/hosts", api_token, {"uuid": host_uuid, "address": address})
 
 
 async def create_node(

@@ -14,11 +14,38 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🌐 Домены", callback_data="menu:domains"),
         ],
         [
+            InlineKeyboardButton(text="📋 Наборы IP", callback_data="menu:ip_sets"),
+            InlineKeyboardButton(text="🤖 Автоматизации", callback_data="menu:automations"),
+        ],
+        [
             InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings"),
         ],
         [
             InlineKeyboardButton(text="🔄 Сменить организацию", callback_data="org:switch"),
         ],
+    ])
+
+
+def ip_sets_menu_kb(sets: list) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=s.tag, callback_data=f"ipset:view:{s.id}")]
+        for s in sets
+    ]
+    rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="ipset:add")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ip_set_detail_kb(set_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить набор", callback_data=f"ipset:delete:{set_id}")],
+        [InlineKeyboardButton(text="◀️ Назад к наборам", callback_data="ipset:back")],
+    ])
+
+
+def ip_set_cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="ipset:cancel")],
     ])
 
 
@@ -38,10 +65,38 @@ def settings_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="AmazonWS", callback_data="settings:amazonws"),
+            InlineKeyboardButton(text="🔍 Pingachock", callback_data="settings:pingachock"),
         ],
         [
             InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back"),
         ],
+    ])
+
+
+# ── Pingachock ─────────────────────────────────────────────────────────────────
+
+def pingachock_not_configured_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔌 Подключить", callback_data="pc:connect")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:settings")],
+    ])
+
+
+def pingachock_configured_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✏️ Изменить URL", callback_data="pc:edit_url"),
+            InlineKeyboardButton(text="🔑 Изменить ключ", callback_data="pc:edit_key"),
+        ],
+        [InlineKeyboardButton(text="🔄 Проверить соединение", callback_data="pc:test")],
+        [InlineKeyboardButton(text="🗑 Отключить", callback_data="pc:delete")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:settings")],
+    ])
+
+
+def pingachock_cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="pc:cancel")],
     ])
 
 
@@ -59,9 +114,7 @@ def remnawave_kb() -> InlineKeyboardMarkup:
 
 def cancel_input_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="❌ Отмена", callback_data="remnawave:add_cancel"),
-        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="remnawave:add_cancel")],
     ])
 
 
@@ -102,9 +155,7 @@ def panel_detail_kb(panel_id: int, monitoring_enabled: bool = True) -> InlineKey
 
 def cancel_edit_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="❌ Отмена", callback_data="rwp:cancel_edit"),
-        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="rwp:cancel_edit")],
     ])
 
 
@@ -120,7 +171,7 @@ def cloudflare_kb(email: str | None, has_api_key: bool) -> InlineKeyboardMarkup:
 
 def cancel_cf_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cf:cancel")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="cf:cancel")],
     ])
 
 
@@ -165,7 +216,7 @@ def back_to_node_kb(panel_id: int, node_uuid: str) -> InlineKeyboardMarkup:
 
 def nd_cancel_kb(panel_id: int, node_uuid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"nd:cancel:{panel_id}:{node_uuid}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"nd:cancel:{panel_id}:{node_uuid}")],
     ])
 
 
@@ -173,7 +224,7 @@ def nd_overwrite_kb(panel_id: int, node_uuid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Да, перезаписать", callback_data="nd:overwrite:yes"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data=f"nd:cancel:{panel_id}:{node_uuid}"),
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"nd:cancel:{panel_id}:{node_uuid}"),
         ],
     ])
 
@@ -184,7 +235,7 @@ def nodes_restart_type_kb(panel_id: int, node_uuid: str) -> InlineKeyboardMarkup
             InlineKeyboardButton(text="🔄 Плавно", callback_data=f"nodes:restart_type:{panel_id}:{node_uuid}:0"),
             InlineKeyboardButton(text="⚡ Принудительно", callback_data=f"nodes:restart_type:{panel_id}:{node_uuid}:1"),
         ],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"nodes:node:{panel_id}:{node_uuid}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"nodes:node:{panel_id}:{node_uuid}")],
     ])
 
 
@@ -195,7 +246,7 @@ def nodes_restart_confirm_kb(panel_id: int, node_uuid: str, force: str) -> Inlin
                 text="✅ Да, перезапустить",
                 callback_data=f"nodes:restart_conf:{panel_id}:{node_uuid}:{force}",
             ),
-            InlineKeyboardButton(text="❌ Отмена", callback_data=f"nodes:node:{panel_id}:{node_uuid}"),
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"nodes:node:{panel_id}:{node_uuid}"),
         ],
     ])
 
@@ -214,13 +265,28 @@ def deploy_select_panel_kb(panels: list) -> InlineKeyboardMarkup:
         for p in panels
     ]
     rows.append([InlineKeyboardButton(text="Не подключать к Remnawave", callback_data="deploy:panel:none")])
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="deploy:cancel")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="deploy:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def become_method_kb(has_password: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if has_password:
+        rows.append([InlineKeyboardButton(
+            text="🔑 Тот же пароль что SSH",
+            callback_data="deploy:become:same_pass",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="🔓 Без пароля (NOPASSWD sudo)",
+        callback_data="deploy:become:nopass",
+    )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="deploy:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def deploy_cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="deploy:cancel")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="deploy:cancel")],
     ])
 
 
@@ -244,7 +310,7 @@ def amazonws_kb() -> InlineKeyboardMarkup:
 
 def cancel_aws_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="aws:add_cancel")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="aws:add_cancel")],
     ])
 
 
@@ -275,7 +341,7 @@ def aws_detail_kb(account_id: int) -> InlineKeyboardMarkup:
 
 def cancel_aws_edit_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="aws:cancel_edit")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="aws:cancel_edit")],
     ])
 
 
@@ -295,13 +361,81 @@ def hosts_tags_kb(tags: list[str]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=tag, callback_data=f"hosts:tag:{i}")]
         for i, tag in enumerate(tags)
     ]
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="hosts:cancel")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="hosts:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def hosts_cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="hosts:cancel")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="hosts:back")],
+    ])
+
+
+def hosts_top_mode_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Указать вручную", callback_data="hosts:top:manual")],
+        [InlineKeyboardButton(text="📋 Использовать Наборы IP", callback_data="hosts:top:ipsets")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="hosts:back")],
+    ])
+
+
+def hosts_source_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 Автоматически", callback_data="hosts:source:auto")],
+        [InlineKeyboardButton(text="📋 Вручную", callback_data="hosts:source:manual")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="hosts:back")],
+    ])
+
+
+def hosts_distribution_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔢 Всем одинаковый IP", callback_data="hosts:dist:same")],
+        [InlineKeyboardButton(text="🔀 Каждому свой IP", callback_data="hosts:dist:each")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="hosts:back")],
+    ])
+
+
+def hosts_ip_sets_kb(sets: list) -> InlineKeyboardMarkup:
+    rows = []
+    for s in sets:
+        count = len(s.addresses.splitlines())
+        rows.append([InlineKeyboardButton(
+            text=f"📋 {s.tag}  ({count:,} записей)",
+            callback_data=f"hosts:ipset:{s.id}",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="hosts:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def hosts_ip_page_kb(
+    ips: list[str],
+    page: int,
+    has_prev: bool,
+    has_next: bool,
+) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=ip, callback_data=f"hosts:ip:{ip}")] for ip in ips]
+    nav: list[InlineKeyboardButton] = []
+    if has_prev:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"hosts:ippage:{page - 1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"hosts:ippage:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="hosts:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def hosts_confirm_bulk_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Применить", callback_data="hosts:bulk:confirm")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="hosts:back")],
+    ])
+
+
+def hosts_auto_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Применить", callback_data="hosts:auto:confirm")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="hosts:back")],
     ])
 
 
@@ -374,7 +508,7 @@ def domains_delete_confirm_kb(zone_id: str, ridx: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Удалить", callback_data=f"dom:delok:{zone_id}:{ridx}"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data=f"dom:rec:{zone_id}:{ridx}"),
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"dom:rec:{zone_id}:{ridx}"),
         ],
     ])
 
@@ -382,5 +516,116 @@ def domains_delete_confirm_kb(zone_id: str, ridx: int) -> InlineKeyboardMarkup:
 def domains_cancel_kb(zone_id: str | None = None) -> InlineKeyboardMarkup:
     cb = f"dom:cancel:{zone_id}" if zone_id else "dom:cancel"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=cb)],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=cb)],
+    ])
+
+
+# ── Automations: Availability groups ──────────────────────────────────────────
+
+_AVAIL_INTERVALS = [5, 10, 15, 30, 60]
+
+
+def avail_groups_kb(groups: list, panels_by_id: dict) -> InlineKeyboardMarkup:
+    """List of existing automation groups.
+
+    panels_by_id: dict[int, RemnaWavePanel] — for showing panel tag.
+    """
+    rows = []
+    for g in groups:
+        panel = panels_by_id.get(g.panel_id)
+        panel_label = panel.tag if panel else "?"
+        status = "✅" if g.enabled else "❌"
+        interval_label = f"{g.interval_minutes}мин"
+        dist_label = "≡" if g.distribution == "same" else "⊞"
+        rows.append([InlineKeyboardButton(
+            text=f"{status} {g.host_tag} ({panel_label}) | {interval_label} {dist_label}",
+            callback_data=f"avail:group:{g.id}",
+        )])
+    rows.append([InlineKeyboardButton(text="➕ Добавить группу", callback_data="avail:add")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def avail_group_detail_kb(group_id: int, enabled: bool) -> InlineKeyboardMarkup:
+    toggle_text = "⏸ Приостановить" if enabled else "▶️ Возобновить"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=toggle_text, callback_data=f"avail:toggle:{group_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"avail:delete_confirm:{group_id}"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="avail:list")],
+    ])
+
+
+def avail_delete_confirm_kb(group_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"avail:delete:{group_id}"),
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"avail:group:{group_id}"),
+        ],
+    ])
+
+
+def avail_panels_kb(panels: list) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=p.tag, callback_data=f"avail:panel:{p.id}")]
+        for p in panels
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="avail:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def avail_tags_kb(tags: list[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=tag, callback_data=f"avail:tag:{i}")]
+        for i, tag in enumerate(tags)
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="avail:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def avail_ip_sets_kb(sets_info: list[dict], selected_ids: list[int]) -> InlineKeyboardMarkup:
+    """Multi-select IP sets.  sets_info: list of {id, tag, count}."""
+    rows = []
+    for s in sets_info:
+        mark = "✅" if s["id"] in selected_ids else "☐"
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} {s['tag']} ({s['count']:,} записей)",
+            callback_data=f"avail:toggle_set:{s['id']}",
+        )])
+    if selected_ids:
+        rows.append([InlineKeyboardButton(
+            text="✅ Подтвердить выбор",
+            callback_data="avail:confirm_sets",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="avail:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def avail_distribution_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔢 Всем одинаковый IP", callback_data="avail:dist:same")],
+        [InlineKeyboardButton(text="🔀 Каждому свой IP", callback_data="avail:dist:each")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="avail:back")],
+    ])
+
+
+def avail_interval_kb(selected: int | None = None) -> InlineKeyboardMarkup:
+    def _btn(n: int) -> InlineKeyboardButton:
+        mark = "✅ " if n == selected else ""
+        return InlineKeyboardButton(
+            text=f"{mark}{n}мин",
+            callback_data=f"avail:interval:{n}",
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(5), _btn(10), _btn(15)],
+        [_btn(30), _btn(60)],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="avail:back")],
+    ])
+
+
+def avail_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Создать", callback_data="avail:confirm_create")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="avail:back")],
     ])

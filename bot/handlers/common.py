@@ -3,6 +3,7 @@ import asyncio
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,11 +22,13 @@ MENU_TEXT = "Вы в главном меню"
 @router.message(CommandStart())
 async def start_handler(
     message: Message,
+    state: FSMContext,
     db_user: User,
     active_org: Organization | None,
     session: AsyncSession,
     user_orgs: list | None = None,
 ) -> None:
+    await state.clear()
     if active_org is None:
         if user_orgs is not None:
             # Injected by middleware (multiple orgs case)

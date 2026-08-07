@@ -6,3 +6,4 @@ pydantic-settings==2.6.1
 redis==5.2.0
 asyncssh==2.18.0
 bcrypt==4.2.1
+ansible-core==2.18.6

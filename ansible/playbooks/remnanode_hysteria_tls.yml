@@ -1,0 +1,68 @@
+---
+- name: Развёртывание Remnanode + Hysteria + TLS
+  hosts: target
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Установка Docker
+      shell: curl -fsSL https://get.docker.com | sh
+      args:
+        creates: /usr/bin/docker
+
+    - name: Создание директорий certbot
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /opt/certbot/certs
+        - /opt/certbot/var-lib-letsencrypt
+
+    - name: Получение SSL-сертификата
+      shell: >
+        docker run --rm
+        -v /opt/certbot/certs:/etc/letsencrypt
+        -v /opt/certbot/var-lib-letsencrypt:/var/lib/letsencrypt
+        --network host
+        certbot/certbot certonly --standalone
+        --non-interactive --agree-tos
+        --email {{ email }}
+        -d {{ domain }}
+      args:
+        creates: /opt/certbot/certs/live/{{ domain }}/fullchain.pem
+
+    - name: Создание директории /opt/remnanode
+      file:
+        path: /opt/remnanode
+        state: directory
+        mode: "0755"
+
+    - name: Остановка существующего контейнера
+      shell: docker compose down
+      args:
+        chdir: /opt/remnanode
+      ignore_errors: yes
+
+    - name: Запись docker-compose.yml с TLS
+      template:
+        src: remnanode-hysteria-compose.yml.j2
+        dest: /opt/remnanode/docker-compose.yml
+      no_log: true
+
+    - name: Pull образа remnawave/node
+      shell: docker compose pull
+      args:
+        chdir: /opt/remnanode
+
+    - name: Запуск Remnanode с TLS
+      shell: docker compose up -d
+      args:
+        chdir: /opt/remnanode
+
+    - name: Авторенью сертификата (cron)
+      cron:
+        name: "certbot renew remnanode"
+        minute: "0"
+        hour: "0"
+        day: "28"
+        job: "docker run --rm -v /opt/certbot/certs:/etc/letsencrypt -v /opt/certbot/var-lib-letsencrypt:/var/lib/letsencrypt certbot/certbot renew"

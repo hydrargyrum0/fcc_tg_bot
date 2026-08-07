@@ -102,6 +102,13 @@ class RemnaWaveService:
         )
         return list(result.scalars().all())
 
+    async def get_panel_by_id_any(self, panel_id: int) -> RemnaWavePanel | None:
+        """Load panel without org restriction — for background monitor tasks."""
+        result = await self.session.execute(
+            select(RemnaWavePanel).where(RemnaWavePanel.id == panel_id)
+        )
+        return result.scalar_one_or_none()
+
     async def delete_panel(self, panel_id: int, org_id: int) -> bool:
         panel = await self.get_panel_by_id(panel_id, org_id)
         if not panel:

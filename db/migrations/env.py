@@ -16,6 +16,9 @@ from db.models.cloudflare_settings import CloudflareSettings  # noqa: F401
 from db.models.aws_account import AWSAccount  # noqa: F401
 from db.models.organization import Organization  # noqa: F401
 from db.models.organization_member import OrganizationMember  # noqa: F401
+from db.models.ip_set import IpSet  # noqa: F401
+from db.models.pingachock_settings import PingachockSettings  # noqa: F401
+from db.models.automation_group import AutomationGroup  # noqa: F401
 from config import settings
 
 config = context.config

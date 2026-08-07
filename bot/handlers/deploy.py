@@ -16,6 +16,7 @@ from aiogram.types import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.keyboards.inline import (
+    become_method_kb,
     config_profile_select_kb,
     deploy_cancel_kb,
     deploy_presets_kb,
@@ -32,6 +33,7 @@ from services.cloudflare_api import (
     list_zones,
     update_a_record,
 )
+from services import ansible_service
 from services.cloudflare_service import CloudflareService
 from services.remnawave_api_service import (
     RemnaWaveAPIError,
@@ -43,11 +45,9 @@ from services.remnawave_api_service import (
     update_config_profile,
 )
 from services.remnawave_service import RemnaWaveService
-from services.ssh_certbot_service import deploy_remnanode_hysteria
 from services.ssh_deploy_service import (
     SSHAuthError,
     SSHKeyPassphraseRequired,
-    deploy_remnanode,
     parse_private_key,
 )
 
@@ -256,11 +256,57 @@ async def auth_got_passphrase(
 
 async def _after_auth(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession) -> None:
     data = await state.get_data()
+    if data.get("login") != "root":
+        await state.set_state(DeployRemnanode.waiting_become_method)
+        has_password = data.get("auth_method") == "password"
+        await message.answer(
+            f"Логин <b>{data['login']}</b> — не root.\n\n"
+            "Нужен ли sudo для выполнения команд? Выберите вариант или введите sudo-пароль текстом:",
+            reply_markup=become_method_kb(has_password=has_password),
+            parse_mode="HTML",
+        )
+        return
+    await _after_become_remnanode(message, state, active_org, session)
+
+
+async def _after_become_remnanode(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession) -> None:
+    data = await state.get_data()
     if data.get("panel_id") is None:
         await state.set_state(DeployRemnanode.waiting_secret_key)
         await message.answer("Укажите Remnanode Secret Key:", reply_markup=deploy_cancel_kb())
     else:
         await _run_deployment(message, state, active_org, session)
+
+
+@router.callback_query(DeployRemnanode.waiting_become_method, F.data == "deploy:become:nopass")
+async def rn_become_nopass(
+    call: CallbackQuery, state: FSMContext, active_org: Organization, session: AsyncSession,
+) -> None:
+    await call.answer()
+    await state.update_data(become_pass=None)
+    await _after_become_remnanode(call.message, state, active_org, session)
+
+
+@router.callback_query(DeployRemnanode.waiting_become_method, F.data == "deploy:become:same_pass")
+async def rn_become_same_pass(
+    call: CallbackQuery, state: FSMContext, active_org: Organization, session: AsyncSession,
+) -> None:
+    await call.answer()
+    data = await state.get_data()
+    await state.update_data(become_pass=data.get("password"))
+    await _after_become_remnanode(call.message, state, active_org, session)
+
+
+@router.message(DeployRemnanode.waiting_become_method)
+async def rn_become_got_pass(
+    message: Message, state: FSMContext, active_org: Organization, session: AsyncSession,
+) -> None:
+    become_pass = (message.text or "").strip()
+    if not become_pass:
+        await message.answer("Пароль не может быть пустым. Введите sudo-пароль или выберите вариант выше:")
+        return
+    await state.update_data(become_pass=become_pass)
+    await _after_become_remnanode(message, state, active_org, session)
 
 
 @router.message(DeployRemnanode.waiting_secret_key)
@@ -310,10 +356,12 @@ async def _run_deployment(message: Message, state: FSMContext, active_org: Organ
         node_port = data["node_port"]
 
     password = data.get("password")
-    client_key = None
+    key_data = None
+    key_passphrase = None
     if data.get("auth_method") == "key":
-        key_bytes = base64.b64decode(data["key_data_b64"])
-        client_key = parse_private_key(key_bytes, passphrase=data.get("key_passphrase"))
+        key_data = base64.b64decode(data["key_data_b64"])
+        key_passphrase = data.get("key_passphrase")
+    become_pass = data.get("become_pass")
 
     # Per-IP status tracking with background updater
     ip_statuses: dict[str, str] = {ip: "⏳ Подключаюсь..." for ip in ips}
@@ -348,21 +396,23 @@ async def _run_deployment(message: Message, state: FSMContext, active_org: Organ
         async def progress(text: str) -> None:
             ip_statuses[ip] = text
 
-        try:
-            await deploy_remnanode(
-                ip=ip,
-                login=data["login"],
-                password=password,
-                client_key=client_key,
-                secret_key=secret_key,
-                port=node_port,
-                progress_cb=progress,
-            )
+        success, err_msg = await ansible_service.run_playbook(
+            playbook="remnanode",
+            host=ip,
+            login=data["login"],
+            password=password,
+            key_data=key_data,
+            key_passphrase=key_passphrase,
+            become_pass=become_pass,
+            extra_vars={"secret_key": secret_key, "node_port": node_port},
+            progress_cb=progress,
+        )
+        if success:
             ip_statuses[ip] = "✅ Установлена"
             return ip, None
-        except Exception as e:
-            ip_statuses[ip] = f"❌ {str(e)[:60]}"
-            return ip, str(e)
+        else:
+            ip_statuses[ip] = f"❌ {err_msg[:60]}"
+            return ip, err_msg
 
     updater = asyncio.create_task(_periodic_updater())
     try:
@@ -674,7 +724,7 @@ async def hys_auth_got_key_file(
         key_data_b64=base64.b64encode(key_bytes).decode(),
         key_passphrase=None,
     )
-    await _hys_deploy_node(message, state, active_org, session)
+    await _hys_after_auth(message, state, active_org, session)
 
 
 @router.message(DeployHysteria.waiting_auth)
@@ -689,7 +739,7 @@ async def hys_auth_got_password(
         await message.answer("Пришлите пароль текстом или файл с ключом:", reply_markup=deploy_cancel_kb())
         return
     await state.update_data(auth_method="password", password=password)
-    await _hys_deploy_node(message, state, active_org, session)
+    await _hys_after_auth(message, state, active_org, session)
 
 
 @router.message(DeployHysteria.waiting_key_passphrase)
@@ -708,6 +758,54 @@ async def hys_auth_got_passphrase(
         await message.answer(f"{e}\nВведите key-phrase ещё раз:", reply_markup=deploy_cancel_kb())
         return
     await state.update_data(key_passphrase=passphrase)
+    await _hys_after_auth(message, state, active_org, session)
+
+
+async def _hys_after_auth(
+    message: Message, state: FSMContext, active_org: Organization, session: AsyncSession,
+) -> None:
+    data = await state.get_data()
+    if data.get("login") != "root":
+        await state.set_state(DeployHysteria.waiting_become_method)
+        has_password = data.get("auth_method") == "password"
+        await message.answer(
+            f"Логин <b>{data['login']}</b> — не root.\n\n"
+            "Нужен ли sudo для выполнения команд? Выберите вариант или введите sudo-пароль текстом:",
+            reply_markup=become_method_kb(has_password=has_password),
+            parse_mode="HTML",
+        )
+        return
+    await _hys_deploy_node(message, state, active_org, session)
+
+
+@router.callback_query(DeployHysteria.waiting_become_method, F.data == "deploy:become:nopass")
+async def hys_become_nopass(
+    call: CallbackQuery, state: FSMContext, active_org: Organization, session: AsyncSession,
+) -> None:
+    await call.answer()
+    await state.update_data(become_pass=None)
+    await _hys_deploy_node(call.message, state, active_org, session)
+
+
+@router.callback_query(DeployHysteria.waiting_become_method, F.data == "deploy:become:same_pass")
+async def hys_become_same_pass(
+    call: CallbackQuery, state: FSMContext, active_org: Organization, session: AsyncSession,
+) -> None:
+    await call.answer()
+    data = await state.get_data()
+    await state.update_data(become_pass=data.get("password"))
+    await _hys_deploy_node(call.message, state, active_org, session)
+
+
+@router.message(DeployHysteria.waiting_become_method)
+async def hys_become_got_pass(
+    message: Message, state: FSMContext, active_org: Organization, session: AsyncSession,
+) -> None:
+    become_pass = (message.text or "").strip()
+    if not become_pass:
+        await message.answer("Пароль не может быть пустым. Введите sudo-пароль или выберите вариант выше:")
+        return
+    await state.update_data(become_pass=become_pass)
     await _hys_deploy_node(message, state, active_org, session)
 
 
@@ -730,10 +828,12 @@ async def _hys_deploy_node(
         return
 
     password = data.get("password")
-    client_key = None
+    key_data = None
+    key_passphrase = None
     if data.get("auth_method") == "key":
-        key_bytes = base64.b64decode(data["key_data_b64"])
-        client_key = parse_private_key(key_bytes, passphrase=data.get("key_passphrase"))
+        key_data = base64.b64decode(data["key_data_b64"])
+        key_passphrase = data.get("key_passphrase")
+    become_pass = data.get("become_pass")
 
     status_msg = await message.answer(f"🚀 Разворачиваю Remnanode на {ip}...\n\n⏳ Подключаюсь...")
 
@@ -743,19 +843,20 @@ async def _hys_deploy_node(
         except Exception:
             pass
 
-    try:
-        await deploy_remnanode(
-            ip=ip,
-            login=data["login"],
-            password=password,
-            client_key=client_key,
-            secret_key=panel.node_secret_key,
-            port=panel.node_port,
-            progress_cb=progress,
-        )
-    except Exception as e:
+    success, err_msg = await ansible_service.run_playbook(
+        playbook="remnanode",
+        host=ip,
+        login=data["login"],
+        password=password,
+        key_data=key_data,
+        key_passphrase=key_passphrase,
+        become_pass=become_pass,
+        extra_vars={"secret_key": panel.node_secret_key, "node_port": panel.node_port},
+        progress_cb=progress,
+    )
+    if not success:
         await state.clear()
-        await status_msg.edit_text(f"❌ Ошибка развёртывания:\n{str(e)[:300]}")
+        await status_msg.edit_text(f"❌ Ошибка развёртывания:\n{err_msg[:300]}")
         return
 
     await status_msg.edit_text(f"✅ Remnanode установлена на {ip}\n\n⏳ Загружаю профили...")
@@ -1040,10 +1141,12 @@ async def hys_got_subdomain(
     )
 
     password = data.get("password")
-    client_key = None
+    key_data = None
+    key_passphrase = None
     if data.get("auth_method") == "key":
-        key_bytes = base64.b64decode(data["key_data_b64"])
-        client_key = parse_private_key(key_bytes, passphrase=data.get("key_passphrase"))
+        key_data = base64.b64decode(data["key_data_b64"])
+        key_passphrase = data.get("key_passphrase")
+    become_pass = data.get("become_pass")
 
     async def progress(text: str) -> None:
         try:
@@ -1053,23 +1156,27 @@ async def hys_got_subdomain(
         except Exception:
             pass
 
-    try:
-        await deploy_remnanode_hysteria(
-            ip=ip,
-            login=data["login"],
-            password=password,
-            client_key=client_key,
-            domain=full_domain,
-            letsencrypt_email=cf.email,
-            node_secret=panel.node_secret_key,
-            node_port=panel.node_port,
-            progress_cb=progress,
-        )
-    except Exception as e:
+    success, err_msg = await ansible_service.run_playbook(
+        playbook="remnanode_hysteria_tls",
+        host=ip,
+        login=data["login"],
+        password=password,
+        key_data=key_data,
+        key_passphrase=key_passphrase,
+        become_pass=become_pass,
+        extra_vars={
+            "domain": full_domain,
+            "email": cf.email,
+            "secret_key": panel.node_secret_key,
+            "node_port": panel.node_port,
+        },
+        progress_cb=progress,
+    )
+    if not success:
         await state.clear()
         await status_msg.edit_text(
             f"✅ DNS запись создана: {full_domain} → {ip}\n\n"
-            f"❌ Ошибка при выпуске сертификата:\n{str(e)[:300]}"
+            f"❌ Ошибка при выпуске сертификата:\n{err_msg[:300]}"
         )
         return
 

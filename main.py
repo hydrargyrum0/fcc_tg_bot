@@ -6,17 +6,20 @@ from aiogram.fsm.storage.redis import RedisStorage
 from redis.asyncio import Redis
 
 from bot.handlers import (
+    automation_fsm,
     aws_fsm,
     cloudflare_fsm,
     common,
     deploy,
     domains_fsm,
     hosts_fsm,
+    ip_sets,
     member,
     monitoring,
     node_domain_fsm,
     nodes_menu,
     org_select,
+    pingachock_fsm,
     remnawave_fsm,
     superadmin,
 )
@@ -25,6 +28,7 @@ from bot.middlewares.redis import RedisMiddleware
 from bot.middlewares.role import RoleMiddleware
 from config import settings
 from db.session import async_session_factory
+from services.availability_monitor import run_availability_monitor
 from services.monitoring_service import run_monitoring
 
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +45,9 @@ async def main() -> None:
     dp.update.outer_middleware(RedisMiddleware(redis=redis))
 
     dp.include_router(org_select.router)
+    dp.include_router(automation_fsm.router)
+    dp.include_router(ip_sets.router)
+    dp.include_router(pingachock_fsm.router)
     dp.include_router(hosts_fsm.router)
     dp.include_router(domains_fsm.router)
     dp.include_router(remnawave_fsm.router)
@@ -55,12 +62,20 @@ async def main() -> None:
     dp.include_router(member.router)
 
     monitoring_task = asyncio.create_task(run_monitoring(bot, redis))
+    availability_task = asyncio.create_task(
+        run_availability_monitor(bot, async_session_factory)
+    )
     try:
         await dp.start_polling(bot)
     finally:
         monitoring_task.cancel()
+        availability_task.cancel()
         try:
             await monitoring_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await availability_task
         except asyncio.CancelledError:
             pass
         await redis.aclose()

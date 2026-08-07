@@ -1,0 +1,32 @@
+---
+- name: Развёртывание Remnanode
+  hosts: target
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Установка Docker
+      shell: curl -fsSL https://get.docker.com | sh
+      args:
+        creates: /usr/bin/docker
+
+    - name: Создание директории /opt/remnanode
+      file:
+        path: /opt/remnanode
+        state: directory
+        mode: "0755"
+
+    - name: Запись docker-compose.yml
+      template:
+        src: remnanode-compose.yml.j2
+        dest: /opt/remnanode/docker-compose.yml
+      no_log: true
+
+    - name: Pull образа remnawave/node
+      shell: docker compose pull
+      args:
+        chdir: /opt/remnanode
+
+    - name: Запуск Remnanode
+      shell: docker compose up -d
+      args:
+        chdir: /opt/remnanode
