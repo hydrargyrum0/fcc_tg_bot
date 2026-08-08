@@ -1,9 +1,7 @@
 """DB service for automation groups (one per org/tag combination)."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.automation_group import AutomationGroup
@@ -79,6 +77,6 @@ class AutomationService:
         await self._s.execute(
             update(AutomationGroup)
             .where(AutomationGroup.id == group_id)
-            .values(last_checked_at=datetime.now(timezone.utc))
+            .values(last_checked_at=func.now())
         )
         await self._s.commit()
