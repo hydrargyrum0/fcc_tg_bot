@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.keyboards.inline import cancel_cf_kb, cloudflare_kb
 from bot.states.cloudflare import EditCloudflare
 from db.models.organization import Organization
+from db.models.user import User
+from services.audit_service import send_audit
 from services.cloudflare_service import CloudflareService
 
 router = Router()
@@ -57,10 +59,13 @@ async def got_email(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
+    email = (message.text or "").strip()
     svc = CloudflareService(session)
-    await svc.update_email(active_org.id, (message.text or "").strip())
+    await svc.update_email(active_org.id, email)
     await state.clear()
+    send_audit(message.bot, active_org.id, db_user, f"Обновил Cloudflare email: {email}")
     await _show_cloudflare(message, active_org, session, edit=False)
 
 
@@ -70,10 +75,12 @@ async def got_api_key(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     svc = CloudflareService(session)
     await svc.update_api_key(active_org.id, (message.text or "").strip())
     await state.clear()
+    send_audit(message.bot, active_org.id, db_user, "Обновил Cloudflare API Key")
     await _show_cloudflare(message, active_org, session, edit=False)
 
 

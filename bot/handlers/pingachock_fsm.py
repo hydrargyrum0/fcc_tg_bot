@@ -13,6 +13,8 @@ from bot.keyboards.inline import (
 )
 from bot.states.pingachock import PingachockFSM
 from db.models.organization import Organization
+from db.models.user import User
+from services.audit_service import send_audit
 from services.pingachock_api_service import PingachockAPIError, get_nodes
 from services.pingachock_service import PingachockService
 
@@ -125,6 +127,7 @@ async def got_key(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     key = (message.text or "").strip()
     if not key:
@@ -154,6 +157,7 @@ async def got_key(
 
     online = sum(1 for n in nodes if n.get("online"))
     total = len(nodes)
+    send_audit(message.bot, active_org.id, db_user, f"Подключил Pingachock: {api_url}")
     await status_msg.edit_text(
         f"✅ <b>Pingachock подключён!</b>\n\n"
         f"🌐 <code>{api_url}</code>\n"
@@ -233,10 +237,12 @@ async def delete_settings(
     call: CallbackQuery,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     await call.answer()
     svc = PingachockService(session)
     await svc.delete_settings(active_org.id)
+    send_audit(call.bot, active_org.id, db_user, "Удалил настройки Pingachock")
     await _show_menu(call, session, active_org, edit=True)
 
 

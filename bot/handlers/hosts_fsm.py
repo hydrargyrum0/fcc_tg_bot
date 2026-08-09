@@ -35,6 +35,8 @@ from bot.keyboards.inline import (
 )
 from bot.states.hosts import HostsFSM
 from db.models.organization import Organization
+from db.models.user import User
+from services.audit_service import send_audit
 from services.ip_check_service import CHECK_BATCH as _CHECK_BATCH, distributed_check as _distributed_check, expand_addresses as _expand_addresses
 from services.ip_set_service import IpSetService
 from services.pingachock_api_service import PingachockAPIError
@@ -206,6 +208,7 @@ async def got_address(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     address = (message.text or "").strip()
     if not address:
@@ -257,6 +260,10 @@ async def got_address(
             parse_mode="HTML",
         )
     else:
+        send_audit(
+            message.bot, active_org.id, db_user,
+            f"Вручную установил адрес {address} для тега «{tag}» ({len(targets)} хостов) в панели {panel.tag}",
+        )
         await status_msg.edit_text(
             f"✅ Готово!\n\n🏷 Тег: <b>{tag}</b>\n"
             f"🌐 Адрес: <code>{address}</code>\n"
@@ -540,6 +547,7 @@ async def manual_bulk_confirm(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     await call.answer()
     data = await state.get_data()
@@ -575,6 +583,10 @@ async def manual_bulk_confirm(
     pairs = list(zip(targets, ips))
     await state.clear()
 
+    send_audit(
+        call.bot, active_org.id, db_user,
+        f"Вручную раздал IPs из набора «{ip_set.tag}» тегу «{tag}» ({len(pairs)} хостов) в панели {panel.tag}",
+    )
     await _apply_pairs(call.message, pairs, panel, tag, ip_set.tag)
 
 
@@ -772,6 +784,7 @@ async def auto_confirm(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     await call.answer()
     data = await state.get_data()
@@ -800,10 +813,18 @@ async def auto_confirm(
 
     if distribution == "same":
         ip: str = data["auto_ip"]
+        send_audit(
+            call.bot, active_org.id, db_user,
+            f"Автоматически установил IP {ip} тегу «{tag}» ({len(targets)} хостов) в панели {panel.tag}",
+        )
         await _apply_same_ip(call.message, None, session, active_org, ip, prefetched=(panel, targets, tag))
     else:
         each_ips: list[str] = data.get("auto_each_ips", [])
         real_pairs = list(zip(targets, each_ips))
+        send_audit(
+            call.bot, active_org.id, db_user,
+            f"Автоматически раздал IPs (Pingachock) тегу «{tag}» ({len(real_pairs)} хостов) в панели {panel.tag}",
+        )
         await _apply_pairs(call.message, real_pairs, panel, tag, "Pingachock")
 
 

@@ -11,6 +11,8 @@ from bot.keyboards.inline import ip_set_cancel_kb, ip_set_detail_kb, ip_sets_men
 from bot.states.ip_sets import AddIpSet
 from db.models.ip_set import IpSet
 from db.models.organization import Organization
+from db.models.user import User
+from services.audit_service import send_audit
 from services.ip_set_service import IpSetService
 
 router = Router()
@@ -147,7 +149,7 @@ async def ipset_view(
 
 @router.callback_query(F.data.regexp(r"^ipset:delete:(\d+)$"))
 async def ipset_delete(
-    call: CallbackQuery, active_org: Organization, session: AsyncSession,
+    call: CallbackQuery, active_org: Organization, session: AsyncSession, db_user: User,
 ) -> None:
     await call.answer()
     set_id = int(call.data.split(":")[2])
@@ -157,7 +159,9 @@ async def ipset_delete(
         await call.answer("Набор не найден.", show_alert=True)
         return
     tag = ip_set.tag
+    count = len(ip_set.addresses.splitlines())
     await svc.delete_set(set_id, active_org.id)
+    send_audit(call.bot, active_org.id, db_user, f"Удалил набор IP: {tag} ({count:,} записей)")
     await _show_menu(call, session, active_org)
     await call.answer(f"✅ Набор «{tag}» удалён.", show_alert=False)
 
@@ -251,6 +255,7 @@ async def ipset_got_tag(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     tag = (message.text or "").strip()
     if not tag:
@@ -268,6 +273,7 @@ async def ipset_got_tag(
     await svc.add_set(active_org.id, tag, addresses)
     await state.clear()
 
+    send_audit(message.bot, active_org.id, db_user, f"Добавил набор IP: {tag} ({count:,} записей)")
     # Show updated menu
     await _show_menu(message, session, active_org, edit=False)
     await message.answer(f"✅ Набор <b>{tag}</b> ({count:,} записей) сохранён.", parse_mode="HTML")

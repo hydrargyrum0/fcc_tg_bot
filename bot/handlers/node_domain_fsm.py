@@ -11,6 +11,7 @@ from bot.keyboards.inline import nd_cancel_kb, nd_overwrite_kb
 from bot.states.node_domain import NodeDomainFSM
 from db.models.organization import Organization
 from db.models.user import User
+from services.audit_service import send_audit
 from services.cloudflare_api import (
     CloudflareAPIError,
     create_a_record,
@@ -234,6 +235,7 @@ async def auth_got_key_file(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     data = await state.get_data()
     panel_id, node_uuid = data["panel_id"], data["node_uuid"]
@@ -267,7 +269,7 @@ async def auth_got_key_file(
         key_data_b64=base64.b64encode(key_bytes).decode(),
         key_passphrase=None,
     )
-    await _run_domain_setup(message, state, active_org, session)
+    await _run_domain_setup(message, state, active_org, session, db_user)
 
 
 # ── Step 4b: Auth — password ───────────────────────────────────────────────────
@@ -278,6 +280,7 @@ async def auth_got_password(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     password = (message.text or "").strip()
     data = await state.get_data()
@@ -291,7 +294,7 @@ async def auth_got_password(
         return
 
     await state.update_data(auth_method="password", password=password)
-    await _run_domain_setup(message, state, active_org, session)
+    await _run_domain_setup(message, state, active_org, session, db_user)
 
 
 # ── Step 4c: Key passphrase ────────────────────────────────────────────────────
@@ -302,6 +305,7 @@ async def auth_got_passphrase(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     passphrase = (message.text or "").strip()
     data = await state.get_data()
@@ -318,7 +322,7 @@ async def auth_got_passphrase(
         return
 
     await state.update_data(key_passphrase=passphrase)
-    await _run_domain_setup(message, state, active_org, session)
+    await _run_domain_setup(message, state, active_org, session, db_user)
 
 
 # ── Execute ────────────────────────────────────────────────────────────────────
@@ -328,6 +332,7 @@ async def _run_domain_setup(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     data = await state.get_data()
     await state.clear()
@@ -432,6 +437,10 @@ async def _run_domain_setup(
         )
         return
 
+    send_audit(
+        message.bot, active_org.id, db_user,
+        f"Привязал домен {domain} к ноде (A-запись → {ip}, SSL Let's Encrypt)",
+    )
     await status_msg.edit_text(
         f"✅ Домен {domain} успешно привязан к ноде!\n\n"
         f"• A-запись: {domain} → {ip}\n"

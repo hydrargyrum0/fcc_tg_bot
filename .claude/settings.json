@@ -14,7 +14,8 @@
       "Bash(python3 -m json.tool)",
       "Bash(curl -sk -X POST -H 'Authorization: Bearer 30961c7975e02bcc6300513d14115258a48355da4d669c20b81015ddaf3c9183' -H 'Content-Type: application/json' -d '{\"targets\":[\"1.1.1.1\",\"8.8.8.8\",\"185.199.108.133\"],\"ports\":[\"icmp\",\"443\"]}' https://pingachock.rapeer.com:30031/api/v1/server-ping)",
       "Bash(curl -sk https://pingachock.rapeer.com:30031/docs/openapi.yaml)",
-      "Bash(curl -sk -H 'Authorization: Bearer 30961c7975e02bcc6300513d14115258a48355da4d669c20b81015ddaf3c9183' https://pingachock.rapeer.com:30031/api/v1/checks?batch_id=e8d3a8b5-accc-4fca-b97a-63b46eb17436)"
+      "Bash(curl -sk -H 'Authorization: Bearer 30961c7975e02bcc6300513d14115258a48355da4d669c20b81015ddaf3c9183' https://pingachock.rapeer.com:30031/api/v1/checks?batch_id=e8d3a8b5-accc-4fca-b97a-63b46eb17436)",
+      "Bash(curl -sk https://pingachock.rapeer.com:30031/docs)"
     ]
   }
 }

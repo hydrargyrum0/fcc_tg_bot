@@ -24,6 +24,8 @@ from bot.keyboards.inline import (
 )
 from bot.states.deploy import DeployHysteria, DeployRemnanode
 from db.models.organization import Organization
+from db.models.user import User
+from services.audit_service import send_audit
 from services.cloudflare_api import (
     CloudflareAPIError,
     create_a_record,
@@ -184,6 +186,7 @@ async def auth_got_key_file(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     file = await message.bot.get_file(message.document.file_id)
     file_io = await message.bot.download_file(file.file_path)
@@ -211,7 +214,7 @@ async def auth_got_key_file(
         key_data_b64=base64.b64encode(key_bytes).decode(),
         key_passphrase=None,
     )
-    await _after_auth(message, state, active_org, session)
+    await _after_auth(message, state, active_org, session, db_user)
 
 
 @router.message(DeployRemnanode.waiting_auth)
@@ -220,6 +223,7 @@ async def auth_got_password(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     password = (message.text or "").strip()
     if not password:
@@ -230,7 +234,7 @@ async def auth_got_password(
         return
 
     await state.update_data(auth_method="password", password=password)
-    await _after_auth(message, state, active_org, session)
+    await _after_auth(message, state, active_org, session, db_user)
 
 
 @router.message(DeployRemnanode.waiting_key_passphrase)
@@ -239,6 +243,7 @@ async def auth_got_passphrase(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     passphrase = (message.text or "").strip()
     data = await state.get_data()
@@ -251,14 +256,15 @@ async def auth_got_passphrase(
         return
 
     await state.update_data(key_passphrase=passphrase)
-    await _after_auth(message, state, active_org, session)
+    await _after_auth(message, state, active_org, session, db_user)
 
 
-async def _after_auth(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession) -> None:
+async def _after_auth(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession, db_user: User) -> None:
     data = await state.get_data()
     if data.get("login") != "root":
         await state.set_state(DeployRemnanode.waiting_become_method)
         has_password = data.get("auth_method") == "password"
+        await state.update_data(_db_user_id=db_user.id, _db_user_username=db_user.username, _db_user_full_name=db_user.full_name)
         await message.answer(
             f"Логин <b>{data['login']}</b> — не root.\n\n"
             "Нужен ли sudo для выполнения команд? Выберите вариант или введите sudo-пароль текстом:",
@@ -266,47 +272,48 @@ async def _after_auth(message: Message, state: FSMContext, active_org: Organizat
             parse_mode="HTML",
         )
         return
-    await _after_become_remnanode(message, state, active_org, session)
+    await _after_become_remnanode(message, state, active_org, session, db_user)
 
 
-async def _after_become_remnanode(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession) -> None:
+async def _after_become_remnanode(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession, db_user: User) -> None:
     data = await state.get_data()
     if data.get("panel_id") is None:
         await state.set_state(DeployRemnanode.waiting_secret_key)
+        await state.update_data(_db_user_id=db_user.id, _db_user_username=db_user.username, _db_user_full_name=db_user.full_name)
         await message.answer("Укажите Remnanode Secret Key:", reply_markup=deploy_cancel_kb())
     else:
-        await _run_deployment(message, state, active_org, session)
+        await _run_deployment(message, state, active_org, session, db_user)
 
 
 @router.callback_query(DeployRemnanode.waiting_become_method, F.data == "deploy:become:nopass")
 async def rn_become_nopass(
-    call: CallbackQuery, state: FSMContext, active_org: Organization, session: AsyncSession,
+    call: CallbackQuery, state: FSMContext, active_org: Organization, session: AsyncSession, db_user: User,
 ) -> None:
     await call.answer()
     await state.update_data(become_pass=None)
-    await _after_become_remnanode(call.message, state, active_org, session)
+    await _after_become_remnanode(call.message, state, active_org, session, db_user)
 
 
 @router.callback_query(DeployRemnanode.waiting_become_method, F.data == "deploy:become:same_pass")
 async def rn_become_same_pass(
-    call: CallbackQuery, state: FSMContext, active_org: Organization, session: AsyncSession,
+    call: CallbackQuery, state: FSMContext, active_org: Organization, session: AsyncSession, db_user: User,
 ) -> None:
     await call.answer()
     data = await state.get_data()
     await state.update_data(become_pass=data.get("password"))
-    await _after_become_remnanode(call.message, state, active_org, session)
+    await _after_become_remnanode(call.message, state, active_org, session, db_user)
 
 
 @router.message(DeployRemnanode.waiting_become_method)
 async def rn_become_got_pass(
-    message: Message, state: FSMContext, active_org: Organization, session: AsyncSession,
+    message: Message, state: FSMContext, active_org: Organization, session: AsyncSession, db_user: User,
 ) -> None:
     become_pass = (message.text or "").strip()
     if not become_pass:
         await message.answer("Пароль не может быть пустым. Введите sudo-пароль или выберите вариант выше:")
         return
     await state.update_data(become_pass=become_pass)
-    await _after_become_remnanode(message, state, active_org, session)
+    await _after_become_remnanode(message, state, active_org, session, db_user)
 
 
 @router.message(DeployRemnanode.waiting_secret_key)
@@ -326,16 +333,17 @@ async def got_port(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     text = (message.text or "").strip()
     if not text.isdigit():
         await message.answer("Порт должен быть числом. Попробуйте ещё раз:", reply_markup=deploy_cancel_kb())
         return
     await state.update_data(node_port=int(text))
-    await _run_deployment(message, state, active_org, session)
+    await _run_deployment(message, state, active_org, session, db_user)
 
 
-async def _run_deployment(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession) -> None:
+async def _run_deployment(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession, db_user: User) -> None:
     data = await state.get_data()
     panel_id = data.get("panel_id")
     ips: list[str] = data["ips"]
@@ -442,6 +450,10 @@ async def _run_deployment(message: Message, state: FSMContext, active_org: Organ
     if panel_id is None:
         await state.clear()
         suffix = f"\n\n⚠️ {len(failures)} нод(ы) не удалось установить." if failures else ""
+        send_audit(
+            message.bot, active_org.id, db_user,
+            f"Развернул RemnaNode на {len(successes)} сервере(ах): {', '.join(successes)}",
+        )
         await status_msg.edit_text(f"✅ Результат:\n\n{result_text}{suffix}")
         return
 
@@ -491,6 +503,7 @@ async def config_profile_chosen(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     await call.answer()
     profile_uuid = call.data.split(":", 2)[2]
@@ -540,11 +553,19 @@ async def config_profile_chosen(
     await state.clear()
 
     lines = []
+    created = []
     for address, node, err in create_results:
         if err is None:
             lines.append(f"✅ {address}")
+            created.append(address)
         else:
             lines.append(f"❌ {address} — {str(err)[:80]}")
+
+    if created:
+        send_audit(
+            call.bot, active_org.id, db_user,
+            f"Добавил {len(created)} ноды(у) в Remnawave {panel.tag}: {', '.join(created)}",
+        )
 
     await call.message.edit_text(
         "Результат добавления нод в Remnawave:\n\n" + "\n".join(lines)
@@ -1093,6 +1114,7 @@ async def hys_got_subdomain(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     subdomain = (message.text or "").strip().lower().strip(".")
     if not subdomain or "." in subdomain:
@@ -1225,6 +1247,10 @@ async def hys_got_subdomain(
         return
 
     await state.clear()
+    send_audit(
+        message.bot, active_org.id, db_user,
+        f"Развернул RemnaNode+Hysteria+TLS на {ip}, домен {full_domain}, панель {panel.tag}",
+    )
     await status_msg.edit_text(
         f"✅ Готово!\n\n"
         f"🖥 Сервер: {ip}\n"

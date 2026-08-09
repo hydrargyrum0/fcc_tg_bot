@@ -13,6 +13,8 @@ from bot.keyboards.inline import (
 from bot.states.aws import AddAWS, EditAWS
 from db.models.aws_account import AWSAccount
 from db.models.organization import Organization
+from db.models.user import User
+from services.audit_service import send_audit
 from services.aws_service import AWSService
 
 router = Router()
@@ -97,16 +99,19 @@ async def add_got_tag(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     data = await state.get_data()
+    tag = (message.text or "").strip()
     svc = AWSService(session)
     await svc.add_account(
         org_id=active_org.id,
-        tag=(message.text or "").strip(),
+        tag=tag,
         access_key_id=data["access_key_id"],
         secret_access_key=data["secret_access_key"],
     )
     await state.clear()
+    send_audit(message.bot, active_org.id, db_user, f"Добавил AWS аккаунт: {tag}")
     await _show_aws_list(message, active_org, session, edit=False)
 
 
@@ -190,11 +195,15 @@ async def delete_account(
     call: CallbackQuery,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     await call.answer()
     account_id = int(call.data.split(":")[2])
     svc = AWSService(session)
+    account = await svc.get_account_by_id(account_id, active_org.id)
+    tag = account.tag if account else str(account_id)
     await svc.delete_account(account_id, active_org.id)
+    send_audit(call.bot, active_org.id, db_user, f"Удалил AWS аккаунт: {tag}")
     await _show_aws_list(call.message, active_org, session, edit=True)
 
 
@@ -235,13 +244,16 @@ async def edit_got_tag(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     data = await state.get_data()
     account_id: int = data["account_id"]
+    new_tag = (message.text or "").strip()
     svc = AWSService(session)
-    await svc.update_tag(account_id, active_org.id, (message.text or "").strip())
+    await svc.update_tag(account_id, active_org.id, new_tag)
     account = await svc.get_account_by_id(account_id, active_org.id)
     await state.clear()
+    send_audit(message.bot, active_org.id, db_user, f"Изменил тег AWS аккаунта на: {new_tag}")
     await message.answer(_account_detail_text(account), reply_markup=aws_detail_kb(account_id))
 
 
@@ -251,6 +263,7 @@ async def edit_got_access_key_id(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     data = await state.get_data()
     account_id: int = data["account_id"]
@@ -258,6 +271,7 @@ async def edit_got_access_key_id(
     await svc.update_access_key_id(account_id, active_org.id, (message.text or "").strip())
     account = await svc.get_account_by_id(account_id, active_org.id)
     await state.clear()
+    send_audit(message.bot, active_org.id, db_user, f"Обновил Access Key ID для AWS аккаунта: {account.tag if account else account_id}")
     await message.answer(_account_detail_text(account), reply_markup=aws_detail_kb(account_id))
 
 
@@ -267,6 +281,7 @@ async def edit_got_secret_key(
     state: FSMContext,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     data = await state.get_data()
     account_id: int = data["account_id"]
@@ -274,6 +289,7 @@ async def edit_got_secret_key(
     await svc.update_secret_key(account_id, active_org.id, (message.text or "").strip())
     account = await svc.get_account_by_id(account_id, active_org.id)
     await state.clear()
+    send_audit(message.bot, active_org.id, db_user, f"Обновил Secret Key для AWS аккаунта: {account.tag if account else account_id}")
     await message.answer(_account_detail_text(account), reply_markup=aws_detail_kb(account_id))
 
 

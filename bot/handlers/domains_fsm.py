@@ -21,6 +21,8 @@ from bot.keyboards.inline import (
 )
 from bot.states.domains import DomainFSM
 from db.models.organization import Organization
+from db.models.user import User
+from services.audit_service import send_audit
 from services.cloudflare_api import (
     CloudflareAPIError,
     create_a_record,
@@ -250,7 +252,7 @@ async def add_a_got_name(message: Message, state: FSMContext) -> None:
 
 
 @router.message(DomainFSM.waiting_new_a_ip)
-async def add_a_got_ip(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession) -> None:
+async def add_a_got_ip(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession, db_user: User) -> None:
     ip = (message.text or "").strip()
     data = await state.get_data()
     zone_id = data["zone_id"]
@@ -274,6 +276,8 @@ async def add_a_got_ip(message: Message, state: FSMContext, active_org: Organiza
         return
 
     await state.clear()
+    send_audit(message.bot, active_org.id, db_user,
+               f"Создал A-запись: {record_name}.{zone_name} → {ip}")
     await message.answer(
         f"✅ A-запись создана:\n<code>{record_name}.{zone_name}</code> → <code>{ip}</code>",
         reply_markup=_back_to_records_kb(zone_id),
@@ -319,7 +323,7 @@ async def edit_a_start(call: CallbackQuery, state: FSMContext, active_org: Organ
 
 
 @router.message(DomainFSM.waiting_edit_ip)
-async def edit_a_got_ip(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession) -> None:
+async def edit_a_got_ip(message: Message, state: FSMContext, active_org: Organization, session: AsyncSession, db_user: User) -> None:
     ip = (message.text or "").strip()
     data = await state.get_data()
     zone_id = data["zone_id"]
@@ -344,6 +348,8 @@ async def edit_a_got_ip(message: Message, state: FSMContext, active_org: Organiz
         return
 
     await state.clear()
+    send_audit(message.bot, active_org.id, db_user,
+               f"Обновил A-запись: {record_name} → {ip}")
     await message.answer(
         f"✅ A-запись обновлена:\n<code>{record_name}</code> → <code>{ip}</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -388,7 +394,7 @@ async def delete_confirm_cb(call: CallbackQuery, active_org: Organization, sessi
 
 
 @router.callback_query(F.data.startswith("dom:delok:"))
-async def delete_do_cb(call: CallbackQuery, active_org: Organization, session: AsyncSession) -> None:
+async def delete_do_cb(call: CallbackQuery, active_org: Organization, session: AsyncSession, db_user: User) -> None:
     await call.answer()
     parts = call.data.split(":")
     zone_id = parts[2]
@@ -416,6 +422,8 @@ async def delete_do_cb(call: CallbackQuery, active_org: Organization, session: A
         await call.message.edit_text(f"❌ Ошибка при удалении:\n{e}", reply_markup=domains_menu_kb())
         return
 
+    send_audit(call.bot, active_org.id, db_user,
+               f"Удалил A-запись: {record['name']} ({record['content']})")
     await call.message.edit_text(
         f"✅ Запись удалена: {record['name']}",
         reply_markup=_back_to_records_kb(zone_id),

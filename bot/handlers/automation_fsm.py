@@ -36,8 +36,10 @@ from bot.keyboards.inline import (
 )
 from bot.states.automation import AvailGroupFSM
 from db.models.organization import Organization
+from db.models.user import User
+from services.audit_service import send_audit
 from services.automation_service import AutomationService
-from services.availability_monitor import request_skip
+from services.availability_monitor import _processing_groups, request_skip
 from services.ip_set_service import IpSetService
 from services.remnawave_api_service import RemnaWaveAPIError, get_hosts
 from services.remnawave_service import RemnaWaveService
@@ -165,6 +167,7 @@ async def avail_group_toggle(
     call: CallbackQuery,
     session: AsyncSession,
     active_org: Organization,
+    db_user: User,
 ) -> None:
     await call.answer()
     group_id = int(call.data.split(":")[2])
@@ -175,6 +178,10 @@ async def avail_group_toggle(
         return
     status = "▶️ возобновлена" if group.enabled else "⏸ приостановлена"
     await call.answer(f"Группа {status}.", show_alert=False)
+    send_audit(
+        call.bot, active_org.id, db_user,
+        f"{'Возобновил' if group.enabled else 'Приостановил'} группу автоматизации: {group.host_tag}",
+    )
     # Refresh detail view
     await avail_group_detail(call, session, active_org)
 
@@ -205,15 +212,22 @@ async def avail_group_delete(
     call: CallbackQuery,
     session: AsyncSession,
     active_org: Organization,
+    db_user: User,
 ) -> None:
     await call.answer()
     group_id = int(call.data.split(":")[2])
     auto_svc = AutomationService(session)
+    group = await auto_svc.get_group(group_id, active_org.id)
+    if not group:
+        await call.answer("Группа не найдена.", show_alert=True)
+        return
+    host_tag = group.host_tag
     deleted = await auto_svc.delete_group(group_id, active_org.id)
     if not deleted:
         await call.answer("Группа не найдена.", show_alert=True)
         return
     await call.answer("✅ Группа удалена.", show_alert=False)
+    send_audit(call.bot, active_org.id, db_user, f"Удалил группу автоматизации: {host_tag}")
     await _show_groups_list(call, session, active_org)
 
 
@@ -222,8 +236,11 @@ async def avail_group_delete(
 @router.callback_query(F.data.regexp(r"^avail:skip:\d+$"))
 async def avail_skip_check(call: CallbackQuery) -> None:
     group_id = int(call.data.split(":")[2])
-    request_skip(group_id)
-    await call.answer("⏭ Поиск замены будет остановлен", show_alert=False)
+    if group_id in _processing_groups:
+        request_skip(group_id)
+        await call.answer("⏭ Поиск замены будет остановлен", show_alert=False)
+    else:
+        await call.answer("⏰ Время на отмену истекло", show_alert=True)
 
 
 # ── FSM: start adding a group ─────────────────────────────────────────────────
@@ -437,6 +454,7 @@ async def avail_confirm_create(
     state: FSMContext,
     session: AsyncSession,
     active_org: Organization,
+    db_user: User,
 ) -> None:
     await call.answer()
     data = await state.get_data()
@@ -461,6 +479,11 @@ async def avail_confirm_create(
     )
     await state.clear()
     await call.answer("✅ Группа создана!", show_alert=False)
+    send_audit(
+        call.bot, active_org.id, db_user,
+        f"Создал группу автоматизации: тег «{selected_tag}», "
+        f"интервал {interval_minutes} мин, режим «{distribution}»",
+    )
     await _show_groups_list(call, session, active_org)
 
 

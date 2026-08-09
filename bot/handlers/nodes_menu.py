@@ -11,6 +11,8 @@ from bot.keyboards.inline import (
     nodes_restart_type_kb,
 )
 from db.models.organization import Organization
+from db.models.user import User
+from services.audit_service import send_audit
 from services.remnawave_api_service import (
     RemnaWaveAPIError,
     disable_node,
@@ -197,6 +199,7 @@ async def node_restart_confirm_cb(
     call: CallbackQuery,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     await call.answer()
     parts = call.data.split(":", 4)
@@ -224,6 +227,10 @@ async def node_restart_confirm_cb(
 
     if sent:
         text = f"✅ Команда {mode_label} перезапуска отправлена."
+        send_audit(
+            call.bot, active_org.id, db_user,
+            f"Перезапустил ноду (UUID: {node_uuid}) в панели {panel.tag} ({mode_label})",
+        )
     else:
         text = f"⚠️ Команда {mode_label} перезапуска не была отправлена (eventSent=false)."
 
@@ -238,6 +245,7 @@ async def node_toggle_cb(
     call: CallbackQuery,
     active_org: Organization,
     session: AsyncSession,
+    db_user: User,
 ) -> None:
     await call.answer()
     parts = call.data.split(":", 3)
@@ -260,6 +268,11 @@ async def node_toggle_cb(
     except RemnaWaveAPIError as e:
         await call.answer(f"❌ Не удалось {action_label} ноду: {e}", show_alert=True)
         return
+
+    send_audit(
+        call.bot, active_org.id, db_user,
+        f"{'Включил' if is_disabled else 'Выключил'} ноду {node['name']} в панели {panel.tag}",
+    )
 
     try:
         nodes = await get_nodes(panel.url, panel.api_token)
