@@ -291,55 +291,69 @@ async def _do_process_group(
             current_loss_pct=current_loss_pct,
         )
     else:
-        # Group bad hosts by their bad IP.
-        # Multiple hosts sharing the same bad IP → replace together with group label.
-        # Unique bad IPs → replace individually with host name.
-        ip_to_bad_hosts: dict[str, list[dict]] = {}
-        for host in tagged_hosts:
-            host_ip = host.get("address", "").split(":")[0]
-            if host_ip in all_bad_ips:
-                ip_to_bad_hosts.setdefault(host_ip, []).append(host)
+        # "each" distribution — silent background maintenance, no Telegram alerts.
+        # Every host in the group must have a unique IP.
+        # When replacing a bad IP, we exclude ALL other hosts' current IPs
+        # (not just cooldown/bad ones) so the group never has duplicates.
 
-        for bad_ip, hosts_for_ip in ip_to_bad_hosts.items():
+        # Track current IPs of all hosts in the group; updated as replacements are applied.
+        group_ips: dict[str, str] = {
+            h["uuid"]: h.get("address", "").split(":")[0]
+            for h in tagged_hosts
+            if h.get("address")
+        }
+        cooldown_ips = _get_cooldown_ips(group.id)
+
+        for host in tagged_hosts:
             if group.id in _cancel_flags:
                 _cancel_flags.discard(group.id)
                 break
-            is_dead = bad_ip in dead_ips
-            current_loss_pct = all_bad_ips[bad_ip][0]
 
-            if len(hosts_for_ip) == 1:
-                # Single host with this bad IP → use individual host name, one replacement
-                host = hosts_for_ip[0]
-                label = (host.get("remark") or host.get("uuid", ""))[:60]
-                await _replace_ip_for_hosts(
-                    bot=bot,
-                    group=group,
-                    panel=panel,
-                    pc=pc,
-                    hosts_to_fix=hosts_for_ip,
-                    display_bad_ip=bad_ip,
-                    host_label=label,
-                    pool=pool,
-                    set_names=set_names,
-                    member_ids=member_ids,
-                    reason="dead" if is_dead else "lossy",
-                    current_loss_pct=current_loss_pct,
-                )
+            host_ip = group_ips.get(host["uuid"], "")
+            if host_ip not in all_bad_ips:
+                continue
+
+            is_dead = host_ip in dead_ips
+            require_low_loss = not is_dead
+
+            # Exclude: bad IP + cooldown + every OTHER host's current IP in this group
+            other_ips = frozenset(
+                ip for uuid, ip in group_ips.items()
+                if uuid != host["uuid"] and ip
+            )
+            exclude = frozenset({host_ip}) | cooldown_ips | other_ips
+
+            new_ip, loss_pct, rtt_ms = await _find_replacement(
+                pc.api_url, pc.api_key, pool, group.id,
+                exclude_ips=exclude,
+                require_low_loss=require_low_loss,
+            )
+
+            if new_ip:
+                try:
+                    await update_host_address(panel.url, panel.api_token, host["uuid"], new_ip)
+                    group_ips[host["uuid"]] = new_ip  # keep tracking table current
+                    parts: list[str] = []
+                    if loss_pct is not None:
+                        parts.append(f"loss={loss_pct*100:.0f}%")
+                    if rtt_ms is not None:
+                        parts.append(f"rtt={rtt_ms:.0f}ms")
+                    logger.info(
+                        "Group %d [each] silent replace: %s → %s (%s)",
+                        group.id, host_ip, new_ip,
+                        ", ".join(parts) if parts else "no-stats",
+                    )
+                except RemnaWaveAPIError as e:
+                    logger.error(
+                        "Group %d: failed to update host %s: %s",
+                        group.id, host["uuid"], e,
+                    )
             else:
-                # Multiple hosts share this bad IP → show group name,
-                # but assign a UNIQUE new IP to each host (this is "each" mode).
-                await _replace_ips_each_mode(
-                    bot=bot,
-                    group=group,
-                    panel=panel,
-                    pc=pc,
-                    hosts_to_fix=hosts_for_ip,
-                    display_bad_ip=bad_ip,
-                    pool=pool,
-                    set_names=set_names,
-                    member_ids=member_ids,
-                    reason="dead" if is_dead else "lossy",
-                    current_loss_pct=current_loss_pct,
+                logger.warning(
+                    "Group %d [each]: no replacement found for %s (bad IP: %s)",
+                    group.id,
+                    host.get("remark") or host["uuid"],
+                    host_ip,
                 )
 
 
@@ -527,192 +541,6 @@ async def _replace_ip_for_hosts(
         )
 
     # Edit all alert messages with final result
-    for chat_id, msg_id in alert_msgs:
-        try:
-            await bot.edit_message_text(
-                result_text,
-                chat_id=chat_id,
-                message_id=msg_id,
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-
-async def _replace_ips_each_mode(
-    bot: Bot,
-    group: AutomationGroup,
-    panel,
-    pc,
-    hosts_to_fix: list[dict],
-    display_bad_ip: str,
-    pool: list[str],
-    set_names: str,
-    member_ids: list[int],
-    reason: str = "dead",
-    current_loss_pct: float | None = None,
-) -> None:
-    """Each-distribution: find a UNIQUE replacement IP for every host.
-
-    Shows ONE grouped alert (using group tag as label) instead of per-host spam.
-    Each host receives a different IP from the pool.
-    """
-    n = len(hosts_to_fix)
-    host_label = group.host_tag
-    start_t = time.monotonic()
-
-    def _elapsed_str() -> str:
-        secs = int(time.monotonic() - start_t)
-        m, s = divmod(secs, 60)
-        return f"{m}м {s}с" if m else f"{s}с"
-
-    if reason == "lossy":
-        ip_status = (
-            f"потери {current_loss_pct*100:.0f}%"
-            if current_loss_pct is not None
-            else "высокие потери"
-        )
-        alert_base = (
-            f"📉 <b>Высокие потери пакетов</b>\n\n"
-            f"Группа: <b>{host_label}</b> ({n} хостов)\n"
-            f"IP: <code>{display_bad_ip}</code> — {ip_status}\n"
-            f"Ищем замену из: <b>{set_names}</b>"
-        )
-    else:
-        alert_base = (
-            f"⚠️ <b>Недоступный IP</b>\n\n"
-            f"Группа: <b>{host_label}</b> ({n} хостов)\n"
-            f"IP: <code>{display_bad_ip}</code> — недоступен\n"
-            f"Ищем замену из: <b>{set_names}</b>"
-        )
-    skip_kb = _skip_kb(group.id)
-
-    alert_msgs: list[tuple[int, int]] = []
-    for chat_id in member_ids:
-        try:
-            msg = await bot.send_message(
-                chat_id,
-                alert_base + "\n\nПрошло: 0с",
-                parse_mode="HTML",
-                reply_markup=skip_kb,
-            )
-            alert_msgs.append((chat_id, msg.message_id))
-        except Exception:
-            pass
-
-    ticker_done: list[bool] = [False]
-
-    async def _tick() -> None:
-        while not ticker_done[0]:
-            await asyncio.sleep(15)
-            if ticker_done[0]:
-                break
-            new_text = alert_base + f"\n\nПрошло: {_elapsed_str()}"
-            for chat_id, msg_id in alert_msgs:
-                try:
-                    await asyncio.wait_for(
-                        bot.edit_message_text(
-                            new_text,
-                            chat_id=chat_id,
-                            message_id=msg_id,
-                            parse_mode="HTML",
-                            reply_markup=skip_kb,
-                        ),
-                        timeout=6,
-                    )
-                except Exception:
-                    pass
-
-    ticker = asyncio.create_task(_tick())
-
-    # Base exclude: the bad IP itself + cooldown IPs
-    base_exclude = frozenset({display_bad_ip}) | _get_cooldown_ips(group.id)
-    require_low_loss = (reason == "lossy")
-
-    # (host, new_ip, loss_pct, rtt_ms)
-    assigned: list[tuple[dict, str, float | None, float | None]] = []
-    already_used: set[str] = set()
-    cancelled = False
-
-    try:
-        for host in hosts_to_fix:
-            if group.id in _cancel_flags:
-                cancelled = True
-                break
-            # Each host gets a unique IP — exclude everything already assigned
-            exclude = base_exclude | already_used
-            new_ip, loss_pct, rtt_ms = await _find_replacement(
-                pc.api_url, pc.api_key, pool, group.id,
-                exclude_ips=frozenset(exclude),
-                require_low_loss=require_low_loss,
-            )
-            if new_ip:
-                assigned.append((host, new_ip, loss_pct, rtt_ms))
-                already_used.add(new_ip)
-        # Check cancel even if loop finished normally
-        if not cancelled and group.id in _cancel_flags:
-            cancelled = True
-            _cancel_flags.discard(group.id)
-    finally:
-        ticker_done[0] = True
-        ticker.cancel()
-        try:
-            await ticker
-        except asyncio.CancelledError:
-            pass
-
-    # Apply replacements
-    for host, new_ip, _, _ in assigned:
-        try:
-            await update_host_address(panel.url, panel.api_token, host["uuid"], new_ip)
-        except RemnaWaveAPIError as e:
-            logger.error("Group %d: failed to update host %s: %s", group.id, host["uuid"], e)
-
-    elapsed = _elapsed_str()
-    n_replaced = len(assigned)
-
-    if cancelled and n_replaced == 0:
-        result_text = (
-            f"⏭ <b>Поиск отменён</b>\n\n"
-            f"Группа: <b>{host_label}</b>\n"
-            f"IP: <code>{display_bad_ip}</code> — замена не выполнена\n\n"
-            f"Время поиска: {elapsed}"
-        )
-    elif n_replaced == 0:
-        result_text = (
-            f"❌ <b>Замена не найдена</b>\n\n"
-            f"Группа: <b>{host_label}</b>\n"
-            f"IP: <code>{display_bad_ip}</code> — рабочих адресов нет\n\n"
-            f"Время поиска: {elapsed}"
-        )
-    else:
-        # Average quality across all assigned IPs
-        rtt_vals = [rtt for _, _, _, rtt in assigned if rtt is not None]
-        loss_vals = [loss for _, _, loss, _ in assigned if loss is not None]
-        quality_parts: list[str] = []
-        if rtt_vals:
-            quality_parts.append(f"задержка ~{sum(rtt_vals)/len(rtt_vals):.0f}мс")
-        if loss_vals:
-            quality_parts.append(f"потери ~{sum(loss_vals)/len(loss_vals)*100:.0f}%")
-        quality_line = ", ".join(quality_parts)
-
-        verb = "улучшены" if reason == "lossy" else "заменены"
-        if n_replaced == n:
-            header = f"✅ <b>Адреса {verb}</b>"
-            count_line = f"Заменено хостов: {n_replaced}"
-        else:
-            header = f"⚠️ <b>Адреса частично {verb}</b>"
-            count_line = f"Заменено хостов: {n_replaced} из {n}"
-
-        result_text = (
-            f"{header}\n\n"
-            f"Группа: <b>{host_label}</b>\n"
-            f"<code>{display_bad_ip}</code> — {count_line}"
-        )
-        if quality_line:
-            result_text += f"\n{quality_line}"
-        result_text += f"\n\nВремя поиска: {elapsed}"
-
     for chat_id, msg_id in alert_msgs:
         try:
             await bot.edit_message_text(
