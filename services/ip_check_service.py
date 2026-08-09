@@ -130,12 +130,14 @@ async def distributed_ping_check(
     count: int = 4,
     poll_timeout: float = 90.0,
     poll_interval: float = 3.0,
-) -> dict[str, tuple[bool, int, int]]:
-    """ICMP-only ping returning packet loss data from all TM nodes.
+) -> dict[str, tuple[bool, float | None, float | None]]:
+    """ICMP-only ping, single distributed check.
 
-    Returns {ip: (reachable, packets_recv_total, packets_sent_total)}.
-    Aggregates packets across all TM nodes that ran the check.
-    Falls back to (status-based estimate) when raw per-packet data is absent.
+    Returns {ip: (reachable, loss_pct, avg_rtt_ms)} where:
+      reachable  — True if check status is completed / partial
+      loss_pct   — fraction 0.0–1.0 of packets lost; None if no node reported
+                   raw packet data (treat unknown as acceptable, not penalise)
+      avg_rtt_ms — average RTT in milliseconds; None if unavailable
     """
     if not ips:
         return {}
@@ -151,7 +153,7 @@ async def distributed_ping_check(
         id_to_ip[c["id"]] = c["target"]
 
     if not id_to_ip:
-        return {ip: (False, 0, count) for ip in ips}
+        return {ip: (False, None, None) for ip in ips}
 
     batch_id = resp.get("batch_id")
     pending_ids: set[str] = set(id_to_ip.keys())
@@ -170,18 +172,19 @@ async def distributed_ping_check(
             ):
                 pending_ids.discard(c["id"])
 
-    # Fetch individual checks with runs for packet counts
-    results: dict[str, tuple[bool, int, int]] = {}
+    results: dict[str, tuple[bool, float | None, float | None]] = {}
     for check_id, ip in id_to_ip.items():
         try:
             check_data = await get_check(api_url, api_key, check_id, expand="runs")
         except PingachockAPIError:
-            results[ip] = (False, 0, count)
+            results[ip] = (False, None, None)
             continue
 
         reachable = check_data.get("status") in ("completed", "partial")
         total_sent = 0
         total_recv = 0
+        total_rtt_sum = 0.0
+        rtt_count = 0
 
         for run in check_data.get("runs", []):
             if run.get("status") != "done":
@@ -189,27 +192,46 @@ async def distributed_ping_check(
             result = run.get("result") or {}
             raw = result.get("raw") or {}
 
-            # Try common field name conventions from Pingachock agent
-            sent = (raw.get("packets_sent") or raw.get("sent") or
-                    raw.get("PacketsSent"))
+            # Packet counts — only from nodes that report raw data.
+            # No fallback: if a node doesn't send packets, skip its loss data.
+            sent = (raw.get("packets_sent") or raw.get("sent") or raw.get("PacketsSent"))
             recv = (raw.get("packets_recv") or raw.get("received") or
                     raw.get("packets_received") or raw.get("PacketsRecv"))
-
             if sent is not None and recv is not None:
                 total_sent += int(sent)
                 total_recv += int(recv)
-            elif result.get("success"):
-                # Run succeeded but no raw packet data — assume all received
-                total_sent += count
-                total_recv += count
-            # else: run failed, don't count packets
 
-        if total_sent == 0:
-            # No run data at all — estimate from check-level status
-            total_sent = count
-            total_recv = count if reachable else 0
+            # RTT — try common field name conventions.
+            # Go time.Duration is nanoseconds; values ≥ 1_000_000 are converted to ms.
+            rtt_raw = (
+                raw.get("avg_rtt") or raw.get("rtt_avg") or raw.get("avg_ms") or
+                raw.get("AvgRtt") or raw.get("rtt") or raw.get("avg_latency") or
+                raw.get("latency_ms") or raw.get("latency")
+            )
+            if rtt_raw is not None:
+                try:
+                    rtt_val = float(rtt_raw)
+                    if rtt_val >= 1_000_000:
+                        rtt_val /= 1_000_000   # nanoseconds → ms
+                    elif rtt_val >= 1_000:
+                        rtt_val /= 1_000       # microseconds → ms
+                    if rtt_val > 0:
+                        total_rtt_sum += rtt_val
+                        rtt_count += 1
+                except (ValueError, TypeError):
+                    pass
 
-        results[ip] = (reachable, total_recv, total_sent)
+        # loss_pct: None when no node reported raw packet data
+        loss_pct: float | None = None
+        if total_sent > 0:
+            loss_pct = max(0.0, 1.0 - total_recv / total_sent)
+
+        # avg_rtt_ms: None when no node reported RTT
+        avg_rtt_ms: float | None = None
+        if rtt_count > 0:
+            avg_rtt_ms = total_rtt_sum / rtt_count
+
+        results[ip] = (reachable, loss_pct, avg_rtt_ms)
 
     return results
 

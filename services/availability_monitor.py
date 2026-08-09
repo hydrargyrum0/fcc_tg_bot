@@ -2,17 +2,27 @@
 
 Every POLL_INTERVAL seconds checks which AutomationGroups are due for a
 check.  For each due group it fires an asyncio task that:
-  1. Checks all current host IPs via Pingachock distributed check.
+  1. Checks all current host IPs via a single Pingachock distributed check.
   2. For every bad IP: sends an alert to all org members, searches the
      IP-set pool for a working replacement (Pingachock-verified), updates
      Remnawave hosts, then edits the alert with the result.
   3. Updates last_checked_at so the next check happens at the right time.
 
+Checking strategy:
+  A single distributed ping check is made (not Best-of-N). The result is
+  trusted as-is. Loss data is included only when nodes report raw packet
+  counts; nodes that don't report packets are skipped for loss calculation.
+
 Cancel flow:
   The alert message carries an "⏭ Пропустить проверку" button.
   Its callback (`avail:skip:{group_id}`) calls `request_skip(group_id)`.
-  _find_replacement checks the flag between every Pingachock batch and
-  returns None if cancelled.
+  _find_replacement checks the flag between every pool batch and
+  returns (None, None, None) if cancelled.
+
+Display logic (each-distribution):
+  If multiple hosts share the same bad IP → they are replaced together and
+  the group tag is used as the label.  If hosts have different bad IPs →
+  each is processed with its individual host name.
 """
 from __future__ import annotations
 
@@ -207,54 +217,65 @@ async def _do_process_group(
         group_id, group.host_tag, len(tagged_hosts), len(pool), set_names,
     )
 
-    # ── check current IPs via Pingachock ────────────────────────────────────
-    unique_current_ips = list({h.get("address", "") for h in tagged_hosts if h.get("address")})
+    # ── check current IPs via Pingachock (single check) ─────────────────────
+    # Strip port suffixes: Remnawave may store "1.2.3.4:443", Pingachock wants bare IPs.
+    unique_current_ips = list({h.get("address", "").split(":")[0] for h in tagged_hosts if h.get("address")})
     if not unique_current_ips:
         return
 
-    logger.info("Group %d: checking current IPs (Best of 5): %s", group_id, unique_current_ips)
+    logger.info("Group %d: checking current IPs: %s", group_id, unique_current_ips)
     try:
-        ip_results = await _check_best_of_5(pc.api_url, pc.api_key, unique_current_ips)
+        ip_results = await distributed_ping_check(pc.api_url, pc.api_key, unique_current_ips)
     except PingachockAPIError as e:
         logger.error("Group %d: Pingachock check failed: %s", group_id, e)
         return
 
     # Classify each IP: dead / lossy / ok
-    dead_ips: dict[str, float] = {}    # ip → loss_pct (1.0)
-    lossy_ips: dict[str, float] = {}   # ip → loss_pct (>LOSS_THRESHOLD)
-    for ip, (reachable, loss_pct) in ip_results.items():
+    # ip → (loss_pct | None, avg_rtt_ms | None)
+    dead_ips: dict[str, tuple[float | None, float | None]] = {}
+    lossy_ips: dict[str, tuple[float | None, float | None]] = {}
+    for ip, (reachable, loss_pct, avg_rtt_ms) in ip_results.items():
         if not reachable:
-            dead_ips[ip] = loss_pct
-        elif loss_pct > LOSS_THRESHOLD:
-            lossy_ips[ip] = loss_pct
+            dead_ips[ip] = (loss_pct, avg_rtt_ms)
+        elif loss_pct is not None and loss_pct > LOSS_THRESHOLD:
+            lossy_ips[ip] = (loss_pct, avg_rtt_ms)
 
-    log_parts = {
-        ip: f"{'DEAD' if not r else ('LOSSY' if l > LOSS_THRESHOLD else 'OK')} loss={l*100:.0f}%"
-        for ip, (r, l) in ip_results.items()
-    }
-    logger.info("Group %d: quality results: %s", group_id, log_parts)
+    log_parts: dict[str, str] = {}
+    for ip, (reachable, loss_pct, avg_rtt_ms) in ip_results.items():
+        if not reachable:
+            status = "DEAD"
+        elif loss_pct is not None and loss_pct > LOSS_THRESHOLD:
+            status = "LOSSY"
+        else:
+            status = "OK"
+        loss_str = f"loss={loss_pct*100:.0f}%" if loss_pct is not None else "loss=?"
+        rtt_str = f" rtt={avg_rtt_ms:.0f}ms" if avg_rtt_ms is not None else ""
+        log_parts[ip] = f"{status} {loss_str}{rtt_str}"
+    logger.info("Group %d: check results: %s", group_id, log_parts)
 
     if not dead_ips and not lossy_ips:
-        logger.info("Group %d: all IPs OK (loss ≤ 25%%)", group_id)
+        logger.info("Group %d: all IPs OK", group_id)
         return
 
     if dead_ips:
         logger.info("Group %d: dead IPs: %s", group_id, list(dead_ips))
     if lossy_ips:
-        logger.info("Group %d: lossy IPs (>1/4 loss): %s", group_id, {
-            ip: f"{l*100:.0f}%" for ip, l in lossy_ips.items()
+        logger.info("Group %d: lossy IPs (>%.0f%% loss): %s", group_id, LOSS_THRESHOLD * 100, {
+            ip: f"{l*100:.0f}%" for ip, (l, _) in lossy_ips.items() if l is not None
         })
 
     # All bad IPs go into cooldown — prevents cycling between bad addresses
     _mark_ips_failed(group_id, set(dead_ips) | set(lossy_ips))
 
-    all_bad_ips = {**dead_ips, **lossy_ips}
+    # ip → (loss_pct | None, avg_rtt_ms | None)
+    all_bad_ips: dict[str, tuple[float | None, float | None]] = {**dead_ips, **lossy_ips}
 
     # ── fix bad IPs according to distribution mode ───────────────────────────
     if group.distribution == "same":
         # All hosts share one IP — treat the whole group as a unit.
         bad_ip = next(iter(all_bad_ips))
         is_dead = bad_ip in dead_ips
+        current_loss_pct = all_bad_ips[bad_ip][0]
         await _replace_ip_for_hosts(
             bot=bot,
             group=group,
@@ -267,32 +288,45 @@ async def _do_process_group(
             set_names=set_names,
             member_ids=member_ids,
             reason="dead" if is_dead else "lossy",
-            loss_pct=all_bad_ips[bad_ip],
+            current_loss_pct=current_loss_pct,
         )
     else:
-        # Each host may have its own IP — process bad ones sequentially.
+        # Group bad hosts by their bad IP.
+        # Multiple hosts sharing the same bad IP → replace together with group label.
+        # Unique bad IPs → replace individually with host name.
+        ip_to_bad_hosts: dict[str, list[dict]] = {}
         for host in tagged_hosts:
+            host_ip = host.get("address", "").split(":")[0]
+            if host_ip in all_bad_ips:
+                ip_to_bad_hosts.setdefault(host_ip, []).append(host)
+
+        for bad_ip, hosts_for_ip in ip_to_bad_hosts.items():
             if group.id in _cancel_flags:
                 _cancel_flags.discard(group.id)
                 break
-            host_ip = host.get("address", "")
-            if host_ip not in all_bad_ips:
-                continue
-            label = (host.get("remark") or host.get("uuid", ""))[:60]
-            is_dead = host_ip in dead_ips
+            is_dead = bad_ip in dead_ips
+            current_loss_pct = all_bad_ips[bad_ip][0]
+
+            if len(hosts_for_ip) > 1:
+                # Multiple hosts share this bad IP → show group name
+                label = group.host_tag
+            else:
+                host = hosts_for_ip[0]
+                label = (host.get("remark") or host.get("uuid", ""))[:60]
+
             await _replace_ip_for_hosts(
                 bot=bot,
                 group=group,
                 panel=panel,
                 pc=pc,
-                hosts_to_fix=[host],
-                display_bad_ip=host_ip,
+                hosts_to_fix=hosts_for_ip,
+                display_bad_ip=bad_ip,
                 host_label=label,
                 pool=pool,
                 set_names=set_names,
                 member_ids=member_ids,
                 reason="dead" if is_dead else "lossy",
-                loss_pct=all_bad_ips[host_ip],
+                current_loss_pct=current_loss_pct,
             )
 
 
@@ -309,8 +343,8 @@ async def _replace_ip_for_hosts(
     pool: list[str],
     set_names: str,
     member_ids: list[int],
-    reason: str = "dead",    # "dead" — недоступен; "lossy" — высокие потери
-    loss_pct: float = 1.0,
+    reason: str = "dead",                  # "dead" — недоступен; "lossy" — высокие потери
+    current_loss_pct: float | None = None, # потери текущего (плохого) IP, None если нет данных
 ) -> None:
     """Send live alert, search for replacement, apply, edit alert with result."""
     start_t = time.monotonic()
@@ -321,13 +355,16 @@ async def _replace_ip_for_hosts(
         return f"{m}м {s}с" if m else f"{s}с"
 
     if reason == "lossy":
-        # >1/4 packets lost — show actual loss as N/4
-        loss_count = round(loss_pct * 4)
+        ip_status = (
+            f"потери {current_loss_pct*100:.0f}%"
+            if current_loss_pct is not None
+            else "высокие потери"
+        )
         alert_base = (
             f"📉 <b>Высокие потери пакетов</b>\n\n"
             f"Хост/группа: <b>{host_label}</b>\n"
-            f"IP: <code>{display_bad_ip}</code> — потери {loss_count}/4 пакетов\n"
-            f"Ищем замену с лучшим качеством из: <b>{set_names}</b>"
+            f"IP: <code>{display_bad_ip}</code> — {ip_status}\n"
+            f"Ищем замену из: <b>{set_names}</b>"
         )
     else:
         alert_base = (
@@ -404,9 +441,11 @@ async def _replace_ip_for_hosts(
     require_low_loss = (reason == "lossy")
 
     new_ip: str | None = None
+    new_loss_pct: float | None = None
+    new_rtt_ms: float | None = None
     cancelled = False
     try:
-        new_ip = await _find_replacement(
+        new_ip, new_loss_pct, new_rtt_ms = await _find_replacement(
             pc.api_url, pc.api_key, pool, group.id,
             exclude_ips=exclude_for_replacement,
             require_low_loss=require_low_loss,
@@ -433,21 +472,25 @@ async def _replace_ip_for_hosts(
                 logger.error(
                     "Group %d: failed to update host %s: %s", group.id, h["uuid"], e
                 )
-        if reason == "lossy":
-            result_text = (
-                f"✅ <b>Адрес улучшен</b>\n\n"
-                f"Хост/группа: <b>{host_label}</b>\n"
-                f"<code>{display_bad_ip}</code> → <code>{new_ip}</code>\n"
-                f"Потери устранены\n\n"
-                f"Время поиска: {elapsed}"
-            )
-        else:
-            result_text = (
-                f"✅ <b>Адрес заменён</b>\n\n"
-                f"Хост/группа: <b>{host_label}</b>\n"
-                f"<code>{display_bad_ip}</code> → <code>{new_ip}</code>\n\n"
-                f"Время поиска: {elapsed}"
-            )
+
+        # Quality line: latency and loss of the new IP
+        quality_parts: list[str] = []
+        if new_rtt_ms is not None:
+            quality_parts.append(f"задержка {new_rtt_ms:.0f}мс")
+        if new_loss_pct is not None:
+            quality_parts.append(f"потери {new_loss_pct*100:.0f}%")
+        quality_line = ", ".join(quality_parts)
+
+        verb = "улучшен" if reason == "lossy" else "заменён"
+        result_text = (
+            f"✅ <b>Адрес {verb}</b>\n\n"
+            f"Хост/группа: <b>{host_label}</b>\n"
+            f"<code>{display_bad_ip}</code> → <code>{new_ip}</code>"
+        )
+        if quality_line:
+            result_text += f"\n{quality_line}"
+        result_text += f"\n\nВремя поиска: {elapsed}"
+
     elif cancelled:
         result_text = (
             f"⏭ <b>Поиск отменён</b>\n\n"
@@ -483,71 +526,6 @@ async def _replace_ip_for_hosts(
             pass
 
 
-async def _check_best_of_5(
-    api_url: str,
-    api_key: str,
-    ips: list[str],
-) -> dict[str, tuple[bool, float]]:
-    """Sequential Best-of-5 with packet-loss tracking.
-
-    Runs up to 5 ICMP-ping rounds (4 packets each). Only undecided IPs are
-    included in each round; an IP is decided when it reaches ≥3 OK or ≥3 FAIL
-    votes. Packet counts are accumulated across all OK rounds.
-
-    Returns {ip: (reachable, loss_pct)} where:
-      reachable — True if ≥3 rounds reported the IP as reachable
-      loss_pct  — fraction of packets lost (0.0–1.0) across reachable rounds;
-                  1.0 if unreachable or no packet data available
-    """
-    ok_votes: dict[str, int] = {ip: 0 for ip in ips}
-    fail_votes: dict[str, int] = {ip: 0 for ip in ips}
-    total_sent: dict[str, int] = {ip: 0 for ip in ips}
-    total_recv: dict[str, int] = {ip: 0 for ip in ips}
-
-    for round_num in range(1, 6):
-        undecided = [ip for ip in ips if ok_votes[ip] < 3 and fail_votes[ip] < 3]
-        if not undecided:
-            logger.debug("Bo5: all %d IPs decided after round %d", len(ips), round_num - 1)
-            break
-
-        logger.debug("Bo5 round %d/5: checking %d IPs: %s", round_num, len(undecided), undecided)
-        try:
-            ping_results = await distributed_ping_check(api_url, api_key, undecided)
-        except PingachockAPIError as e:
-            logger.warning("Bo5 round %d: Pingachock error — counting as FAIL: %s", round_num, e)
-            for ip in undecided:
-                fail_votes[ip] += 1
-            continue
-
-        for ip in undecided:
-            reachable, recv, sent = ping_results.get(ip, (False, 0, 4))
-            if reachable:
-                ok_votes[ip] += 1
-                total_sent[ip] += sent
-                total_recv[ip] += recv
-            else:
-                fail_votes[ip] += 1
-
-        tally = {}
-        for ip in ips:
-            if total_sent[ip] > 0:
-                loss = 1.0 - total_recv[ip] / total_sent[ip]
-                tally[ip] = f"{ok_votes[ip]}✓/{fail_votes[ip]}✗ loss={loss*100:.0f}%"
-            else:
-                tally[ip] = f"{ok_votes[ip]}✓/{fail_votes[ip]}✗"
-        logger.info("Bo5 round %d: %s", round_num, tally)
-
-    results: dict[str, tuple[bool, float]] = {}
-    for ip in ips:
-        reachable = ok_votes[ip] >= 3
-        if reachable and total_sent[ip] > 0:
-            loss_pct = 1.0 - total_recv[ip] / total_sent[ip]
-        else:
-            loss_pct = 1.0 if not reachable else 0.0
-        results[ip] = (reachable, loss_pct)
-    return results
-
-
 async def _find_replacement(
     api_url: str,
     api_key: str,
@@ -555,42 +533,52 @@ async def _find_replacement(
     group_id: int,
     exclude_ips: frozenset[str] = frozenset(),
     require_low_loss: bool = False,
-) -> str | None:
-    """Scan pool in batches, verify each candidate via BoT5 ICMP ping.
+) -> tuple[str, float | None, float | None] | tuple[None, None, None]:
+    """Scan pool in batches, verify each candidate via a single ping check.
 
     require_low_loss=False (dead IP): accept any reachable IP.
-    require_low_loss=True  (lossy IP): only accept IPs with loss ≤ LOSS_THRESHOLD.
+    require_low_loss=True  (lossy IP): only accept IPs with loss ≤ LOSS_THRESHOLD
+                                       or with no loss data (None — unknown).
 
     exclude_ips: always skipped (current bad IPs + cooldown cache).
-    Returns first qualifying IP or None if pool exhausted / cancelled.
+    Returns (ip, loss_pct, avg_rtt_ms) or (None, None, None) if not found / cancelled.
     """
     offset = 0
     while offset < len(pool):
         if group_id in _cancel_flags:
-            return None
+            return None, None, None
         batch = [ip for ip in pool[offset: offset + CHECK_BATCH] if ip not in exclude_ips]
         offset += CHECK_BATCH
         if not batch:
             continue
         try:
-            results = await _check_best_of_5(api_url, api_key, batch)
+            results = await distributed_ping_check(api_url, api_key, batch)
         except Exception as e:
-            logger.warning("Group %d: BoT5 error during replacement search: %s", group_id, e)
+            logger.warning("Group %d: ping error during replacement search: %s", group_id, e)
             continue
         for ip in batch:
-            reachable, loss_pct = results.get(ip, (False, 1.0))
+            reachable, loss_pct, avg_rtt_ms = results.get(ip, (False, None, None))
             if not reachable:
                 continue
-            if require_low_loss and loss_pct > LOSS_THRESHOLD:
+            # If loss data is available and exceeds threshold — skip (when require_low_loss).
+            # If loss data is absent (None) — accept: no evidence of lossy behaviour.
+            if require_low_loss and loss_pct is not None and loss_pct > LOSS_THRESHOLD:
                 logger.debug(
                     "Group %d: skip %s — reachable but loss=%.0f%% > threshold",
                     group_id, ip, loss_pct * 100,
                 )
                 continue
-            qualifier = f"loss={loss_pct*100:.0f}%"
-            logger.info("Group %d: replacement %s passed BoT5 (%s)", group_id, ip, qualifier)
-            return ip
-    return None
+            parts = []
+            if loss_pct is not None:
+                parts.append(f"loss={loss_pct*100:.0f}%")
+            if avg_rtt_ms is not None:
+                parts.append(f"rtt={avg_rtt_ms:.0f}ms")
+            logger.info(
+                "Group %d: replacement %s found (%s)",
+                group_id, ip, ", ".join(parts) if parts else "no-stats",
+            )
+            return ip, loss_pct, avg_rtt_ms
+    return None, None, None
 
 
 # ── inline keyboard for skip button ──────────────────────────────────────────
