@@ -19,10 +19,11 @@ Cancel flow:
   _find_replacement checks the flag between every pool batch and
   returns (None, None, None) if cancelled.
 
-Display logic (each-distribution):
-  If multiple hosts share the same bad IP → they are replaced together and
-  the group tag is used as the label.  If hosts have different bad IPs →
-  each is processed with its individual host name.
+Distribution modes:
+  "same" — all hosts share one IP.  The group tag is used as the alert label.
+  "each" — each host has a unique IP.  Runs silently (no Telegram alerts).
+           Each bad host gets a unique replacement; all other hosts' IPs are
+           excluded from the search to prevent duplicates within the group.
 """
 from __future__ import annotations
 
@@ -54,7 +55,7 @@ _processing_groups: set[int] = set()  # group IDs currently in-flight
 _cancel_flags: set[int] = set()        # group IDs with cancel requested
 
 # Per-group cooldown for recently-confirmed-bad IPs: {group_id: {ip: monotonic_time}}
-# Prevents cycling between two bad IPs that happen to pass BoT5 as replacement candidates.
+# Prevents cycling between two bad IPs that happen to appear reachable on the first check.
 _recently_failed: dict[int, dict[str, float]] = {}
 FAILED_IP_COOLDOWN = 1800  # 30 minutes — don't reuse a confirmed-bad IP as replacement
 
@@ -68,7 +69,7 @@ def request_skip(group_id: int) -> None:
 
 
 def _mark_ips_failed(group_id: int, ips: set[str]) -> None:
-    """Record IPs that just failed BoT5 — exclude them from replacement search for FAILED_IP_COOLDOWN seconds."""
+    """Record IPs confirmed bad — exclude them from replacement search for FAILED_IP_COOLDOWN seconds."""
     bucket = _recently_failed.setdefault(group_id, {})
     now = time.monotonic()
     for ip in ips:
@@ -402,9 +403,8 @@ async def _replace_ip_for_hosts(
         )
     skip_kb = _skip_kb(group.id)
 
-    # Send initial alert to all org members
-    alert_msgs: list[tuple[int, int]] = []
-    for chat_id in member_ids:
+    # Send initial alert to all org members in parallel
+    async def _send_initial(chat_id: int) -> tuple[int, int] | None:
         try:
             msg = await bot.send_message(
                 chat_id,
@@ -412,13 +412,12 @@ async def _replace_ip_for_hosts(
                 parse_mode="HTML",
                 reply_markup=skip_kb,
             )
-            alert_msgs.append((chat_id, msg.message_id))
+            return (chat_id, msg.message_id)
         except Exception:
-            pass
+            return None
 
-    if not alert_msgs:
-        # No members to notify — still do the replacement silently
-        pass
+    send_results = await asyncio.gather(*[_send_initial(cid) for cid in member_ids])
+    alert_msgs: list[tuple[int, int]] = [r for r in send_results if r is not None]
 
     # ── elapsed ticker ───────────────────────────────────────────────────────
     ticker_done: list[bool] = [False]
@@ -540,8 +539,8 @@ async def _replace_ip_for_hosts(
             f"Время поиска: {elapsed}"
         )
 
-    # Edit all alert messages with final result
-    for chat_id, msg_id in alert_msgs:
+    # Edit all alert messages with final result in parallel
+    async def _edit_final(chat_id: int, msg_id: int) -> None:
         try:
             await bot.edit_message_text(
                 result_text,
@@ -551,6 +550,8 @@ async def _replace_ip_for_hosts(
             )
         except Exception:
             pass
+
+    await asyncio.gather(*[_edit_final(cid, mid) for cid, mid in alert_msgs])
 
 
 async def _find_replacement(

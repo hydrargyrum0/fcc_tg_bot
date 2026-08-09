@@ -1,5 +1,5 @@
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from aiogram import F, Router
@@ -36,7 +36,7 @@ def _normalize_url(raw: str) -> str:
 async def _panel_detail_text(panel: RemnaWavePanel) -> str:
     is_online = await check_panel_online(panel.url, panel.api_token)
     status = "🟢 Онлайн" if is_online else "🔴 Офлайн"
-    checked_at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    checked_at = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M:%S")
     return (
         f"Remnawave — {panel.tag}\n\n"
         f"URL: {panel.url}\n"

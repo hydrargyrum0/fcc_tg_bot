@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -60,11 +60,13 @@ async def _get_panel_org_member_ids(panel_id: int, org_id: int | None) -> list[i
 
 
 async def _broadcast(bot: Bot, member_ids: list[int], text: str, kb=None) -> None:
-    for uid in member_ids:
+    async def _send_one(uid: int) -> None:
         try:
             await bot.send_message(uid, text, reply_markup=kb)
         except Exception as e:
             logger.debug("Monitoring: send to %d failed: %s", uid, e)
+
+    await asyncio.gather(*[_send_one(uid) for uid in member_ids])
 
 
 async def _check_panel(bot: Bot, redis: Redis, panel) -> None:
@@ -74,7 +76,7 @@ async def _check_panel(bot: Bot, redis: Redis, panel) -> None:
         logger.warning("Monitoring: failed to fetch nodes for panel %d: %s", panel.id, e)
         return
 
-    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
     member_ids: list[int] | None = None
 
     async def _ensure_members() -> list[int]:

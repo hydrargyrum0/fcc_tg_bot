@@ -95,7 +95,7 @@ async def distributed_check(
 
     ip_ok: dict[str, bool] = {ip: False for ip in ips}
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + poll_timeout
 
     while pending_ids and loop.time() < deadline:
@@ -158,7 +158,7 @@ async def distributed_ping_check(
     batch_id = resp.get("batch_id")
     pending_ids: set[str] = set(id_to_ip.keys())
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + poll_timeout
     while pending_ids and loop.time() < deadline:
         await asyncio.sleep(poll_interval)
@@ -172,14 +172,21 @@ async def distributed_ping_check(
             ):
                 pending_ids.discard(c["id"])
 
+    # Fetch all check results in parallel — one HTTP request per check ID.
+    check_ids = list(id_to_ip.keys())
+    raw_fetches = await asyncio.gather(
+        *[get_check(api_url, api_key, cid, expand="runs") for cid in check_ids],
+        return_exceptions=True,
+    )
+
     results: dict[str, tuple[bool, float | None, float | None]] = {}
-    for check_id, ip in id_to_ip.items():
-        try:
-            check_data = await get_check(api_url, api_key, check_id, expand="runs")
-        except PingachockAPIError:
+    for check_id, fetch_result in zip(check_ids, raw_fetches):
+        ip = id_to_ip[check_id]
+        if isinstance(fetch_result, Exception):
             results[ip] = (False, None, None)
             continue
 
+        check_data: dict = fetch_result
         reachable = check_data.get("status") in ("completed", "partial")
         total_sent = 0
         total_recv = 0

@@ -117,12 +117,12 @@ async def deploy_remnanode_hysteria(
         script = _build_hysteria_deploy_script(domain, letsencrypt_email, node_secret, node_port)
         sudo_cmd = f"sudo -S -p '' bash -c {shlex.quote(script)}"
 
-        start = asyncio.get_event_loop().time()
+        start = asyncio.get_running_loop().time()
 
         async def _ticker() -> None:
             while True:
                 await asyncio.sleep(15)
-                elapsed = int(asyncio.get_event_loop().time() - start)
+                elapsed = int(asyncio.get_running_loop().time() - start)
                 m, s = divmod(elapsed, 60)
                 await progress_cb(f"⚙️ Устанавливаю... {m}м {s}с")
 
