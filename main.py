@@ -14,6 +14,7 @@ from bot.handlers import (
     domains_fsm,
     hosts_fsm,
     ip_sets,
+    managed_pool_fsm,
     member,
     monitoring,
     node_domain_fsm,
@@ -29,6 +30,7 @@ from bot.middlewares.role import RoleMiddleware
 from config import settings
 from db.session import async_session_factory
 from services.availability_monitor import run_availability_monitor
+from services.ip_pool_scorer import run_ip_pool_scorer
 from services.monitoring_service import run_monitoring
 
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +47,7 @@ async def main() -> None:
     dp.update.outer_middleware(RedisMiddleware(redis=redis))
 
     dp.include_router(org_select.router)
+    dp.include_router(managed_pool_fsm.router)
     dp.include_router(automation_fsm.router)
     dp.include_router(ip_sets.router)
     dp.include_router(pingachock_fsm.router)
@@ -65,17 +68,25 @@ async def main() -> None:
     availability_task = asyncio.create_task(
         run_availability_monitor(bot, async_session_factory)
     )
+    pool_scorer_task = asyncio.create_task(
+        run_ip_pool_scorer(async_session_factory)
+    )
     try:
         await dp.start_polling(bot)
     finally:
         monitoring_task.cancel()
         availability_task.cancel()
+        pool_scorer_task.cancel()
         try:
             await monitoring_task
         except asyncio.CancelledError:
             pass
         try:
             await availability_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await pool_scorer_task
         except asyncio.CancelledError:
             pass
         await redis.aclose()

@@ -6,7 +6,9 @@ UI flow (non-FSM):
 FSM flow (adding a new group):
   avail:add → AvailGroupFSM.choosing_panel
             → AvailGroupFSM.choosing_tag
-            → AvailGroupFSM.choosing_ip_sets   (multi-select)
+            → AvailGroupFSM.choosing_source_type   (user sets vs managed pool)
+            ├── [sets]  → AvailGroupFSM.choosing_ip_sets  (multi-select)
+            └── [pool]  → AvailGroupFSM.choosing_pool
             → AvailGroupFSM.choosing_distribution
             → AvailGroupFSM.choosing_interval
             → AvailGroupFSM.confirming
@@ -31,6 +33,8 @@ from bot.keyboards.inline import (
     avail_interval_kb,
     avail_ip_sets_kb,
     avail_panels_kb,
+    avail_pools_kb,
+    avail_source_type_kb,
     avail_tags_kb,
     main_menu_kb,
 )
@@ -41,6 +45,7 @@ from services.audit_service import send_audit
 from services.automation_service import AutomationService
 from services.availability_monitor import _processing_groups, request_skip
 from services.ip_set_service import IpSetService
+from services.managed_pool_service import ManagedPoolService
 from services.remnawave_api_service import RemnaWaveAPIError, get_hosts
 from services.remnawave_service import RemnaWaveService
 
@@ -133,9 +138,15 @@ async def avail_group_detail(
     panel = await rw_svc.get_panel_by_id(group.panel_id, active_org.id)
     panel_label = panel.tag if panel else "?"
 
-    ip_svc = IpSetService(session)
-    sets = await ip_svc.get_sets_by_ids(list(group.ip_set_ids))
-    sets_label = ", ".join(s.tag for s in sets) if sets else "—"
+    if group.managed_pool_id:
+        pool_svc = ManagedPoolService(session)
+        pool = await pool_svc.get_pool_any(group.managed_pool_id)
+        source_label = f"Управляемый пул: {pool.name}" if pool else f"Пул ID {group.managed_pool_id}"
+    else:
+        ip_svc = IpSetService(session)
+        sets = await ip_svc.get_sets_by_ids(list(group.ip_set_ids))
+        sets_label = ", ".join(s.tag for s in sets) if sets else "—"
+        source_label = f"Наборы IP: {sets_label}"
 
     dist_label = "Всем одинаковый IP" if group.distribution == "same" else "Каждому свой IP"
     status_label = "✅ Активна" if group.enabled else "❌ Приостановлена"
@@ -152,7 +163,7 @@ async def avail_group_detail(
     await call.message.edit_text(
         f"📡 <b>Группа: {group.host_tag}</b>\n\n"
         f"Панель: <b>{panel_label}</b>\n"
-        f"Наборы IP: <b>{sets_label}</b>\n"
+        f"{source_label}\n"
         f"Режим: {dist_label}\n"
         f"Интервал: каждые {group.interval_minutes} мин\n"
         f"Статус: {status_label}\n"
@@ -319,8 +330,6 @@ async def avail_panel_chosen(
 async def avail_tag_chosen(
     call: CallbackQuery,
     state: FSMContext,
-    session: AsyncSession,
-    active_org: Organization,
 ) -> None:
     await call.answer()
     idx = int(call.data.split(":")[2])
@@ -330,13 +339,34 @@ async def avail_tag_chosen(
         await call.answer("Тег не найден.", show_alert=True)
         return
     tag = tags[idx]
+    await state.update_data(selected_tag=tag, selected_set_ids=[], managed_pool_id=None)
+    await state.set_state(AvailGroupFSM.choosing_source_type)
+    await call.message.edit_text(
+        f"Панель: <b>{data['panel_tag']}</b>  |  Тег: <b>{tag}</b>\n\n"
+        "Источник IP-адресов для замен:",
+        reply_markup=avail_source_type_kb(),
+        parse_mode="HTML",
+    )
+
+
+# ── FSM step 3: source type ───────────────────────────────────────────────────
+
+@router.callback_query(AvailGroupFSM.choosing_source_type, F.data == "avail:source:sets")
+async def avail_source_sets(
+    call: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    active_org: Organization,
+) -> None:
+    await call.answer()
+    data = await state.get_data()
 
     ip_svc = IpSetService(session)
     sets = await ip_svc.get_org_sets(active_org.id)
     if not sets:
         await call.message.edit_text(
-            "❌ Нет сохранённых наборов IP.\n\nСначала добавьте набор в разделе «Наборы IP».",
-            reply_markup=avail_tags_kb(tags),
+            "❌ Нет сохранённых наборов IP.\n\nСначала добавьте набор в «Наборы IP → Пользовательские списки».",
+            reply_markup=avail_source_type_kb(),
         )
         return
 
@@ -344,10 +374,10 @@ async def avail_tag_chosen(
         {"id": s.id, "tag": s.tag, "count": len(s.addresses.splitlines())}
         for s in sets
     ]
-    await state.update_data(selected_tag=tag, sets_info=sets_info, selected_set_ids=[])
+    await state.update_data(sets_info=sets_info, selected_set_ids=[], managed_pool_id=None)
     await state.set_state(AvailGroupFSM.choosing_ip_sets)
     await call.message.edit_text(
-        f"Панель: <b>{data['panel_tag']}</b>  |  Тег: <b>{tag}</b>\n\n"
+        f"Панель: <b>{data['panel_tag']}</b>  |  Тег: <b>{data['selected_tag']}</b>\n\n"
         "Выберите один или несколько наборов IP\n"
         "(IP из всех выбранных наборов объединяются в один пул):",
         reply_markup=avail_ip_sets_kb(sets_info, []),
@@ -355,7 +385,43 @@ async def avail_tag_chosen(
     )
 
 
-# ── FSM step 3: toggle IP set selection ──────────────────────────────────────
+@router.callback_query(AvailGroupFSM.choosing_source_type, F.data == "avail:source:pool")
+async def avail_source_pool(
+    call: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    active_org: Organization,
+) -> None:
+    await call.answer()
+    pool_svc = ManagedPoolService(session)
+    pools = await pool_svc.get_org_pools(active_org.id)
+    if not pools:
+        await call.message.edit_text(
+            "❌ Нет управляемых пулов.\n\nСоздайте пул в «Наборы IP → Модерируемые пулы».",
+            reply_markup=avail_source_type_kb(),
+        )
+        return
+    await state.update_data(sets_info=[], selected_set_ids=[], managed_pool_id=None)
+    await state.set_state(AvailGroupFSM.choosing_pool)
+    await call.message.edit_text(
+        "Выберите управляемый пул:",
+        reply_markup=avail_pools_kb(pools),
+    )
+
+
+@router.callback_query(AvailGroupFSM.choosing_pool, F.data.regexp(r"^avail:pool:\d+$"))
+async def avail_pool_chosen(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    pool_id = int(call.data.split(":")[2])
+    await state.update_data(managed_pool_id=pool_id, selected_set_ids=[])
+    await state.set_state(AvailGroupFSM.choosing_distribution)
+    await call.message.edit_text(
+        "Как заменять IP хостам?",
+        reply_markup=avail_distribution_kb(),
+    )
+
+
+# ── FSM step 4: toggle IP set selection ──────────────────────────────────────
 
 @router.callback_query(AvailGroupFSM.choosing_ip_sets, F.data.regexp(r"^avail:toggle_set:\d+$"))
 async def avail_toggle_set(call: CallbackQuery, state: FSMContext) -> None:
@@ -425,20 +491,26 @@ async def _show_confirm(call: CallbackQuery, state: FSMContext) -> None:
     selected_tag: str = data.get("selected_tag", "?")
     sets_info: list[dict] = data.get("sets_info", [])
     selected_ids: list[int] = data.get("selected_set_ids", [])
+    managed_pool_id: int | None = data.get("managed_pool_id")
     distribution: str = data.get("distribution", "same")
     interval: int = data.get("interval_minutes", 15)
 
-    selected_sets = [s for s in sets_info if s["id"] in selected_ids]
-    sets_label = "\n".join(
-        f"  • {s['tag']} ({s['count']:,} записей)" for s in selected_sets
-    ) or "  —"
     dist_label = "🔢 Всем одинаковый IP" if distribution == "same" else "🔀 Каждому свой IP"
+
+    if managed_pool_id:
+        source_section = f"Источник IP:\n  • Управляемый пул ID {managed_pool_id}"
+    else:
+        selected_sets = [s for s in sets_info if s["id"] in selected_ids]
+        sets_label = "\n".join(
+            f"  • {s['tag']} ({s['count']:,} записей)" for s in selected_sets
+        ) or "  —"
+        source_section = f"Наборы IP:\n{sets_label}"
 
     await call.message.edit_text(
         f"✅ <b>Готово к сохранению</b>\n\n"
         f"Панель: <b>{panel_tag}</b>\n"
         f"Тег хостов: <b>{selected_tag}</b>\n"
-        f"Наборы IP:\n{sets_label}\n"
+        f"{source_section}\n"
         f"Режим: {dist_label}\n"
         f"Интервал: каждые <b>{interval} мин</b>",
         reply_markup=avail_confirm_kb(),
@@ -464,8 +536,9 @@ async def avail_confirm_create(
     distribution: str = data.get("distribution", "same")
     interval_minutes: int = data.get("interval_minutes", 15)
 
-    if not selected_set_ids:
-        await call.answer("Не выбраны наборы IP.", show_alert=True)
+    managed_pool_id: int | None = data.get("managed_pool_id")
+    if not managed_pool_id and not selected_set_ids:
+        await call.answer("Не выбраны наборы IP и не выбран пул.", show_alert=True)
         return
 
     auto_svc = AutomationService(session)
@@ -476,6 +549,7 @@ async def avail_confirm_create(
         ip_set_ids=selected_set_ids,
         distribution=distribution,
         interval_minutes=interval_minutes,
+        managed_pool_id=managed_pool_id,
     )
     await state.clear()
     await call.answer("✅ Группа создана!", show_alert=False)
@@ -515,7 +589,7 @@ async def avail_back(
             reply_markup=avail_panels_kb(panels),
         )
 
-    elif current == AvailGroupFSM.choosing_ip_sets:
+    elif current == AvailGroupFSM.choosing_source_type:
         # Back to tag selection
         tags: list[str] = data.get("tags", [])
         panel_tag: str = data.get("panel_tag", "?")
@@ -526,19 +600,54 @@ async def avail_back(
             parse_mode="HTML",
         )
 
-    elif current == AvailGroupFSM.choosing_distribution:
-        # Back to IP sets selection
-        sets_info: list[dict] = data.get("sets_info", [])
-        selected_ids: list[int] = data.get("selected_set_ids", [])
+    elif current == AvailGroupFSM.choosing_ip_sets:
+        # Back to source type selection
         panel_tag = data.get("panel_tag", "?")
         selected_tag = data.get("selected_tag", "?")
-        await state.set_state(AvailGroupFSM.choosing_ip_sets)
+        await state.set_state(AvailGroupFSM.choosing_source_type)
         await call.message.edit_text(
             f"Панель: <b>{panel_tag}</b>  |  Тег: <b>{selected_tag}</b>\n\n"
-            "Выберите один или несколько наборов IP:",
-            reply_markup=avail_ip_sets_kb(sets_info, selected_ids),
+            "Источник IP-адресов для замен:",
+            reply_markup=avail_source_type_kb(),
             parse_mode="HTML",
         )
+
+    elif current == AvailGroupFSM.choosing_pool:
+        # Back to source type selection
+        panel_tag = data.get("panel_tag", "?")
+        selected_tag = data.get("selected_tag", "?")
+        await state.set_state(AvailGroupFSM.choosing_source_type)
+        await call.message.edit_text(
+            f"Панель: <b>{panel_tag}</b>  |  Тег: <b>{selected_tag}</b>\n\n"
+            "Источник IP-адресов для замен:",
+            reply_markup=avail_source_type_kb(),
+            parse_mode="HTML",
+        )
+
+    elif current == AvailGroupFSM.choosing_distribution:
+        # Back to IP sets / pool selection depending on what was chosen
+        managed_pool_id: int | None = data.get("managed_pool_id")
+        if managed_pool_id:
+            # Go back to pool picker
+            pool_svc = ManagedPoolService(session)
+            pools = await pool_svc.get_org_pools(active_org.id)
+            await state.set_state(AvailGroupFSM.choosing_pool)
+            await call.message.edit_text(
+                "Выберите управляемый пул:",
+                reply_markup=avail_pools_kb(pools),
+            )
+        else:
+            sets_info: list[dict] = data.get("sets_info", [])
+            selected_ids: list[int] = data.get("selected_set_ids", [])
+            panel_tag = data.get("panel_tag", "?")
+            selected_tag = data.get("selected_tag", "?")
+            await state.set_state(AvailGroupFSM.choosing_ip_sets)
+            await call.message.edit_text(
+                f"Панель: <b>{panel_tag}</b>  |  Тег: <b>{selected_tag}</b>\n\n"
+                "Выберите один или несколько наборов IP:",
+                reply_markup=avail_ip_sets_kb(sets_info, selected_ids),
+                parse_mode="HTML",
+            )
 
     elif current == AvailGroupFSM.choosing_interval:
         # Back to distribution

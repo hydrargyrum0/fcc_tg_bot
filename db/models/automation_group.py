@@ -26,6 +26,11 @@ class AutomationGroup(Base):
     # 'each' — each bad host gets a separate replacement
     distribution: Mapped[str] = mapped_column(String(10), nullable=False)
     interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Optional: if set, replacements are sourced from a scored managed pool
+    # rather than via real-time Pingachock scan of raw ip_set_ids.
+    managed_pool_id: Mapped[int | None] = mapped_column(
+        ForeignKey("managed_pools.id", ondelete="SET NULL"), nullable=True
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

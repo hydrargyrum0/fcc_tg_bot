@@ -38,10 +38,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from db.models.automation_group import AutomationGroup
+from db.models.managed_pool import ManagedIp
 from db.models.organization_member import OrganizationMember
 from services.automation_service import AutomationService
 from services.ip_check_service import CHECK_BATCH, distributed_ping_check, expand_addresses
 from services.ip_set_service import IpSetService
+from services.managed_pool_service import ManagedPoolService
 from services.pingachock_api_service import PingachockAPIError
 from services.pingachock_service import PingachockService
 from services.remnawave_api_service import RemnaWaveAPIError, get_hosts, update_host_address
@@ -277,20 +279,44 @@ async def _do_process_group(
         bad_ip = next(iter(all_bad_ips))
         is_dead = bad_ip in dead_ips
         current_loss_pct = all_bad_ips[bad_ip][0]
-        await _replace_ip_for_hosts(
-            bot=bot,
-            group=group,
-            panel=panel,
-            pc=pc,
-            hosts_to_fix=tagged_hosts,
-            display_bad_ip=bad_ip,
-            host_label=group.host_tag,
-            pool=pool,
-            set_names=set_names,
-            member_ids=member_ids,
-            reason="dead" if is_dead else "lossy",
-            current_loss_pct=current_loss_pct,
-        )
+
+        if group.managed_pool_id:
+            # Managed pool mode: get replacement from scored pool
+            bad_ips_to_skip = frozenset(
+                h.get("address", "").split(":")[0]
+                for h in tagged_hosts
+                if h.get("address")
+            )
+            cooldown_ips = _get_cooldown_ips(group.id)
+            await _replace_ip_for_hosts_from_pool(
+                bot=bot,
+                group=group,
+                panel=panel,
+                pc=pc,
+                session_factory=session_factory,
+                hosts_to_fix=tagged_hosts,
+                display_bad_ip=bad_ip,
+                host_label=group.host_tag,
+                member_ids=member_ids,
+                reason="dead" if is_dead else "lossy",
+                current_loss_pct=current_loss_pct,
+                exclude_ips=bad_ips_to_skip | cooldown_ips,
+            )
+        else:
+            await _replace_ip_for_hosts(
+                bot=bot,
+                group=group,
+                panel=panel,
+                pc=pc,
+                hosts_to_fix=tagged_hosts,
+                display_bad_ip=bad_ip,
+                host_label=group.host_tag,
+                pool=pool,
+                set_names=set_names,
+                member_ids=member_ids,
+                reason="dead" if is_dead else "lossy",
+                current_loss_pct=current_loss_pct,
+            )
     else:
         # "each" distribution — silent background maintenance, no Telegram alerts.
         # Every host in the group must have a unique IP.
@@ -324,11 +350,17 @@ async def _do_process_group(
             )
             exclude = frozenset({host_ip}) | cooldown_ips | other_ips
 
-            new_ip, loss_pct, rtt_ms = await _find_replacement(
-                pc.api_url, pc.api_key, pool, group.id,
-                exclude_ips=exclude,
-                require_low_loss=require_low_loss,
-            )
+            if group.managed_pool_id:
+                new_ip, loss_pct, rtt_ms, _speed = await _find_replacement_from_pool(
+                    pc.api_url, pc.api_key, session_factory,
+                    group.managed_pool_id, group.id, exclude,
+                )
+            else:
+                new_ip, loss_pct, rtt_ms = await _find_replacement(
+                    pc.api_url, pc.api_key, pool, group.id,
+                    exclude_ips=exclude,
+                    require_low_loss=require_low_loss,
+                )
 
             if new_ip:
                 try:
@@ -540,6 +572,216 @@ async def _replace_ip_for_hosts(
         )
 
     # Edit all alert messages with final result in parallel
+    async def _edit_final(chat_id: int, msg_id: int) -> None:
+        try:
+            await bot.edit_message_text(
+                result_text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    await asyncio.gather(*[_edit_final(cid, mid) for cid, mid in alert_msgs])
+
+
+async def _find_replacement_from_pool(
+    api_url: str,
+    api_key: str,
+    session_factory: async_sessionmaker,
+    pool_id: int,
+    group_id: int,
+    exclude_ips: frozenset[str],
+) -> tuple[str, float | None, float | None, float | None] | tuple[None, None, None, None]:
+    """Get best replacement from a scored managed pool.
+
+    Returns (ip, loss_pct, rtt_ms, speed_mbps) or (None, None, None, None).
+    Runs a final ping check to verify the IP is still alive before returning.
+    """
+    async with session_factory() as session:
+        pool_svc = ManagedPoolService(session)
+        candidates: list[ManagedIp] = await pool_svc.get_approved_ips(pool_id)
+
+    filtered = [c for c in candidates if c.ip not in exclude_ips]
+    if not filtered:
+        logger.warning("Pool %d: no approved IPs available (excluding %d IPs)", pool_id, len(exclude_ips))
+        return None, None, None, None
+
+    # Final liveness check in batches before committing to a replacement
+    for i in range(0, len(filtered), CHECK_BATCH):
+        if group_id in _cancel_flags:
+            return None, None, None, None
+        batch = filtered[i: i + CHECK_BATCH]
+        batch_ips = [c.ip for c in batch]
+        try:
+            ping_results = await distributed_ping_check(api_url, api_key, batch_ips)
+        except PingachockAPIError as e:
+            logger.warning("Pool %d: final ping batch failed: %s", pool_id, e)
+            continue
+        for candidate in batch:
+            reachable, _, _ = ping_results.get(candidate.ip, (False, None, None))
+            if reachable:
+                logger.info(
+                    "Pool %d: replacement %s selected (score=%.0f, speed=%s Mbps)",
+                    pool_id, candidate.ip, candidate.score,
+                    f"{candidate.vless_speed_mbps:.0f}" if candidate.vless_speed_mbps else "?",
+                )
+                return candidate.ip, candidate.ping_loss_pct, candidate.ping_rtt_ms, candidate.vless_speed_mbps
+
+    logger.warning("Pool %d: all approved candidates failed final ping check", pool_id)
+    return None, None, None, None
+
+
+async def _replace_ip_for_hosts_from_pool(
+    bot: Bot,
+    group: AutomationGroup,
+    panel,
+    pc,
+    session_factory: async_sessionmaker,
+    hosts_to_fix: list[dict],
+    display_bad_ip: str,
+    host_label: str,
+    member_ids: list[int],
+    reason: str = "dead",
+    current_loss_pct: float | None = None,
+    exclude_ips: frozenset[str] = frozenset(),
+) -> None:
+    """Managed-pool variant of _replace_ip_for_hosts.
+
+    Sends alert, queries managed pool for best replacement, applies, edits alert.
+    """
+    start_t = time.monotonic()
+
+    def _elapsed_str() -> str:
+        secs = int(time.monotonic() - start_t)
+        m, s = divmod(secs, 60)
+        return f"{m}м {s}с" if m else f"{s}с"
+
+    if reason == "lossy":
+        ip_status = (
+            f"потери {current_loss_pct*100:.0f}%"
+            if current_loss_pct is not None else "высокие потери"
+        )
+        alert_base = (
+            f"📉 <b>Высокие потери пакетов</b>\n\n"
+            f"Хост/группа: <b>{host_label}</b>\n"
+            f"IP: <code>{display_bad_ip}</code> — {ip_status}\n"
+            f"Ищем замену в управляемом пуле..."
+        )
+    else:
+        alert_base = (
+            f"⚠️ <b>Недоступный IP</b>\n\n"
+            f"Хост/группа: <b>{host_label}</b>\n"
+            f"IP: <code>{display_bad_ip}</code> — недоступен\n"
+            f"Ищем замену в управляемом пуле..."
+        )
+
+    skip_kb = _skip_kb(group.id)
+
+    async def _send_initial(chat_id: int) -> tuple[int, int] | None:
+        try:
+            msg = await bot.send_message(
+                chat_id,
+                alert_base + "\n\nПрошло: 0с",
+                parse_mode="HTML",
+                reply_markup=skip_kb,
+            )
+            return (chat_id, msg.message_id)
+        except Exception:
+            return None
+
+    send_results = await asyncio.gather(*[_send_initial(cid) for cid in member_ids])
+    alert_msgs: list[tuple[int, int]] = [r for r in send_results if r is not None]
+
+    ticker_done: list[bool] = [False]
+
+    async def _tick() -> None:
+        while not ticker_done[0]:
+            await asyncio.sleep(15)
+            if ticker_done[0]:
+                break
+            new_text = alert_base + f"\n\nПрошло: {_elapsed_str()}"
+            for chat_id, msg_id in alert_msgs:
+                try:
+                    await asyncio.wait_for(
+                        bot.edit_message_text(
+                            new_text,
+                            chat_id=chat_id,
+                            message_id=msg_id,
+                            parse_mode="HTML",
+                            reply_markup=skip_kb,
+                        ),
+                        timeout=6,
+                    )
+                except Exception:
+                    pass
+
+    ticker = asyncio.create_task(_tick())
+
+    new_ip: str | None = None
+    new_loss_pct: float | None = None
+    new_rtt_ms: float | None = None
+    new_speed_mbps: float | None = None
+    cancelled = False
+    try:
+        new_ip, new_loss_pct, new_rtt_ms, new_speed_mbps = await _find_replacement_from_pool(
+            pc.api_url, pc.api_key, session_factory,
+            group.managed_pool_id, group.id, exclude_ips,
+        )
+        cancelled = group.id in _cancel_flags
+        if cancelled:
+            _cancel_flags.discard(group.id)
+    finally:
+        ticker_done[0] = True
+        ticker.cancel()
+        try:
+            await ticker
+        except asyncio.CancelledError:
+            pass
+
+    elapsed = _elapsed_str()
+
+    if new_ip and not cancelled:
+        for h in hosts_to_fix:
+            try:
+                await update_host_address(panel.url, panel.api_token, h["uuid"], new_ip)
+            except RemnaWaveAPIError as e:
+                logger.error("Group %d: failed to update host %s: %s", group.id, h["uuid"], e)
+
+        quality_parts: list[str] = []
+        if new_rtt_ms is not None:
+            quality_parts.append(f"задержка {new_rtt_ms:.0f}мс")
+        if new_loss_pct is not None:
+            quality_parts.append(f"потери {new_loss_pct*100:.0f}%")
+        if new_speed_mbps is not None:
+            quality_parts.append(f"скорость {new_speed_mbps:.0f} Мбит/с")
+
+        verb = "улучшен" if reason == "lossy" else "заменён"
+        result_text = (
+            f"✅ <b>Адрес {verb}</b>\n\n"
+            f"Хост/группа: <b>{host_label}</b>\n"
+            f"<code>{display_bad_ip}</code> → <code>{new_ip}</code>"
+        )
+        if quality_parts:
+            result_text += "\n" + ", ".join(quality_parts)
+        result_text += f"\n\nВремя поиска: {elapsed}"
+
+    elif cancelled:
+        result_text = (
+            f"⏭ <b>Поиск отменён</b>\n\n"
+            f"Хост/группа: <b>{host_label}</b>\n"
+            f"IP: <code>{display_bad_ip}</code> — замена не выполнена\n\n"
+            f"Время поиска: {elapsed}"
+        )
+    else:
+        result_text = (
+            f"❌ <b>Замена не найдена</b>\n\n"
+            f"Хост/группа: <b>{host_label}</b>\n"
+            f"IP: <code>{display_bad_ip}</code> — в управляемом пуле нет подходящих адресов\n\n"
+            f"Время поиска: {elapsed}"
+        )
+
     async def _edit_final(chat_id: int, msg_id: int) -> None:
         try:
             await bot.edit_message_text(

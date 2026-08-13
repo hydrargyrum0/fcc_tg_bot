@@ -121,6 +121,95 @@ async def update_host_address(panel_url: str, api_token: str, host_uuid: str, ad
     await _patch(f"{panel_url}/api/hosts", api_token, {"uuid": host_uuid, "address": address})
 
 
+async def get_users(panel_url: str, api_token: str) -> list[dict]:
+    """Fetch all users from Remnawave panel."""
+    data = await _get(f"{panel_url}/api/users", api_token)
+    # Remnawave wraps in {"response": {"users": [...], ...}}
+    response = data.get("response", data)
+    if isinstance(response, list):
+        return response
+    return response.get("users", [])
+
+
+async def get_vless_config_for_tag(
+    panel_url: str,
+    api_token: str,
+    service_tg_id: int,
+    host_tag: str,
+) -> dict | None:
+    """Build an Xray VLESS outbound config for a service user filtered to host_tag.
+
+    Returns an Xray-compatible outbound dict ready to send to Pingachock.
+    The `address` field is a placeholder — substitute the test IP before sending.
+    Returns None if the service user or tagged host is not found.
+
+    NOTE: The exact field names depend on your Remnawave version.
+    If this returns None unexpectedly, check the raw /api/users response
+    and adjust field names (telegramId, uuid, subCredentials, etc.) below.
+    """
+    # Step 1: find service user by Telegram ID
+    users = await get_users(panel_url, api_token)
+    service_user = next(
+        (u for u in users if u.get("telegramId") == service_tg_id),
+        None,
+    )
+    if not service_user:
+        return None
+
+    # Step 2: find a host matching the tag
+    hosts = await get_hosts(panel_url, api_token)
+    tagged = [h for h in hosts if host_tag in (h.get("tags") or [])]
+    if not tagged:
+        return None
+    host = tagged[0]  # use first matching host as config template
+
+    # Step 3: extract user UUID
+    # Remnawave may store it as user["uuid"] or user["subCredentials"][0]["uuid"]
+    user_uuid: str = service_user.get("uuid") or ""
+    if not user_uuid:
+        creds = service_user.get("subCredentials") or []
+        if creds:
+            user_uuid = creds[0].get("uuid", "")
+
+    # Step 4: extract host connection parameters
+    address = str(host.get("address") or "").split(":")[0]  # placeholder; caller replaces
+    port = int(host.get("port") or 443)
+    network = str(host.get("network") or "tcp")
+    security = str(host.get("security") or "none")
+
+    outbound: dict = {
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": address,   # REPLACE WITH TEST IP before Pingachock submission
+                "port": port,
+                "users": [{"id": user_uuid, "encryption": "none"}],
+            }]
+        },
+        "streamSettings": {
+            "network": network,
+            "security": security,
+        },
+    }
+
+    # Carry through transport-specific settings when present in host config
+    if host.get("tls_settings"):
+        outbound["streamSettings"]["tlsSettings"] = host["tls_settings"]
+    if host.get("reality_settings"):
+        outbound["streamSettings"]["realitySettings"] = host["reality_settings"]
+    if network == "ws" or host.get("ws_settings"):
+        ws_path = host.get("path") or "/"
+        ws_host = host.get("host") or ""
+        outbound["streamSettings"]["wsSettings"] = {
+            "path": ws_path,
+            "headers": {"Host": ws_host} if ws_host else {},
+        }
+    if network == "grpc" or host.get("grpc_settings"):
+        outbound["streamSettings"]["grpcSettings"] = host.get("grpc_settings") or {}
+
+    return outbound
+
+
 async def create_node(
     panel_url: str,
     api_token: str,

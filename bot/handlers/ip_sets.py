@@ -1,18 +1,18 @@
 from __future__ import annotations
 import io
-import ipaddress
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.keyboards.inline import ip_set_cancel_kb, ip_set_detail_kb, ip_sets_menu_kb
+from bot.keyboards.inline import ip_set_cancel_kb, ip_set_detail_kb, ip_sets_menu_kb, ip_sets_section_kb
 from bot.states.ip_sets import AddIpSet
 from db.models.ip_set import IpSet
 from db.models.organization import Organization
 from db.models.user import User
 from services.audit_service import send_audit
+from services.ip_check_service import normalize_addresses
 from services.ip_set_service import IpSetService
 
 router = Router()
@@ -21,29 +21,6 @@ _MAX_ENTRIES = 5_000_000
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
-
-def _parse_addresses(raw: str) -> tuple[list[str], list[str]]:
-    """Return (valid, invalid). Accepts IPs and CIDR subnets."""
-    valid: list[str] = []
-    invalid: list[str] = []
-    for line in raw.splitlines():
-        entry = line.strip()
-        if not entry or entry.startswith("#"):
-            continue
-        parsed = False
-        for fn in (
-            lambda s: str(ipaddress.ip_network(s, strict=False)),
-            lambda s: str(ipaddress.ip_address(s)),
-        ):
-            try:
-                valid.append(fn(entry))
-                parsed = True
-                break
-            except ValueError:
-                pass
-        if not parsed:
-            invalid.append(entry)
-    return valid, invalid
 
 
 def _sets_text(sets: list[IpSet]) -> str:
@@ -76,6 +53,21 @@ async def _show_menu(
 # ── menu ─────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "menu:ip_sets")
+async def ip_sets_section(
+    call: CallbackQuery,
+) -> None:
+    """Entry screen: split between user lists and managed pools."""
+    await call.answer()
+    await call.message.edit_text(
+        "📋 <b>Наборы IP</b>\n\n"
+        "Пользовательские списки — сырые наборы адресов, загружаемые вручную.\n"
+        "Модерируемые пулы — автоматически проверяемые и оцениваемые адреса.",
+        reply_markup=ip_sets_section_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "ipset:user_lists")
 async def ip_sets_menu(
     call: CallbackQuery, active_org: Organization, session: AsyncSession,
 ) -> None:
@@ -103,7 +95,7 @@ async def ipset_cancel(
         await state.set_state(AddIpSet.waiting_addresses)
         await call.message.edit_text(
             "➕ <b>Новый набор IP</b>\n\n"
-            "Отправьте список адресов — каждый с новой строки.\n"
+            "Отправьте список адресов в любом формате — IP автоматически извлекаются из текста.\n"
             "Поддерживаются одиночные IP и подсети CIDR любого масштаба:\n"
             "<code>1.2.3.4\n10.0.0.0/8\n2001:db8::/32</code>\n\n"
             "Или прикрепите <b>.txt файл</b> с адресами.",
@@ -174,7 +166,7 @@ async def ipset_add_start(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AddIpSet.waiting_addresses)
     await call.message.edit_text(
         "➕ <b>Новый набор IP</b>\n\n"
-        "Отправьте список адресов — каждый с новой строки.\n"
+        "Отправьте список адресов в любом формате — IP автоматически извлекаются из текста.\n"
         "Поддерживаются одиночные IP и подсети CIDR любого масштаба:\n"
         "<code>1.2.3.4\n10.0.0.0/8\n2001:db8::/32</code>\n\n"
         "Или прикрепите <b>.txt файл</b> с адресами.",
@@ -212,14 +204,12 @@ async def ipset_got_text(message: Message, state: FSMContext) -> None:
 
 
 async def _process_addresses(message: Message, state: FSMContext, raw: str) -> None:
-    valid, invalid = _parse_addresses(raw)
+    valid, skipped = normalize_addresses(raw, cap=_MAX_ENTRIES + 1)
 
     if not valid:
-        lines = "\n".join(f"• {e}" for e in invalid[:10])
-        suffix = f"\n...и ещё {len(invalid) - 10}" if len(invalid) > 10 else ""
         await message.answer(
-            f"❌ Не найдено ни одного корректного адреса.\n\nНекорректные строки:\n{lines}{suffix}\n\n"
-            "Попробуйте ещё раз:",
+            "❌ Не найдено ни одного IP-адреса в тексте.\n\n"
+            "Отправьте список адресов или файл с адресами:",
             reply_markup=ip_set_cancel_kb(),
         )
         return
@@ -235,13 +225,11 @@ async def _process_addresses(message: Message, state: FSMContext, raw: str) -> N
     await state.update_data(addresses=addresses_text)
     await state.set_state(AddIpSet.waiting_tag)
 
-    warn = ""
-    if invalid:
-        warn = f"\n⚠️ Пропущено некорректных строк: {len(invalid)}"
+    warn = f"\n⚠️ Пропущено нераспознанных фрагментов: {skipped}" if skipped else ""
 
     await message.answer(
-        f"✅ Принято {len(valid):,} записей.{warn}\n\n"
-        "Введите тег для этого набора (например: <code>RU-суbnets</code>):",
+        f"✅ Принято {len(valid):,} адресов.{warn}\n\n"
+        "Введите тег для этого набора (например: <code>RU-subnets</code>):",
         reply_markup=ip_set_cancel_kb(),
         parse_mode="HTML",
     )

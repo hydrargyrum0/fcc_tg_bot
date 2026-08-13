@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re as _re
 
 from services.pingachock_api_service import (
     PingachockAPIError,
@@ -15,6 +16,50 @@ from services.pingachock_api_service import (
 )
 
 CHECK_BATCH = 5  # IPs per Pingachock distributed-check batch
+
+# Matches bare IPv4, IPv4/CIDR, bare IPv6, IPv6/CIDR embedded in any text
+_IP_PATTERN = _re.compile(
+    r'\b(?:'
+    r'(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?'              # IPv4 (optional CIDR)
+    r'|(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?:/\d{1,3})?'  # IPv6
+    r')\b'
+)
+
+
+def normalize_addresses(text: str, cap: int | None = None) -> tuple[list[str], int]:
+    """Extract and expand all IP/CIDR entries from arbitrary text.
+
+    Ignores surrounding garbage (comments, JSON keys, markdown, etc.).
+    Deduplicates results. CIDRs are expanded to individual host addresses.
+
+    Returns (ips, skipped_count) where skipped_count is regex-matched fragments
+    that failed ipaddress validation (e.g. "192.168.1.999").
+    """
+    raw_matches = _IP_PATTERN.findall(text)
+    ips: list[str] = []
+    seen: set[str] = set()
+    skipped = 0
+    for entry in raw_matches:
+        try:
+            net = ipaddress.ip_network(entry, strict=False)
+            if net.num_addresses == 1:
+                ip = str(net.network_address)
+                if ip not in seen:
+                    seen.add(ip)
+                    ips.append(ip)
+                    if cap and len(ips) >= cap:
+                        return ips, skipped
+            else:
+                for host in net.hosts():
+                    ip = str(host)
+                    if ip not in seen:
+                        seen.add(ip)
+                        ips.append(ip)
+                        if cap and len(ips) >= cap:
+                            return ips, skipped
+        except ValueError:
+            skipped += 1
+    return ips, skipped
 
 
 def expand_addresses(addresses_text: str, cap: int | None = None) -> tuple[list[str], bool]:

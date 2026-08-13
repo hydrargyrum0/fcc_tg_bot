@@ -629,3 +629,96 @@ def avail_confirm_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✅ Создать", callback_data="avail:confirm_create")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="avail:back")],
     ])
+
+
+# ── IP Sets section split ──────────────────────────────────────────────────────
+
+def ip_sets_section_kb() -> InlineKeyboardMarkup:
+    """Entry screen: choose between user lists and managed pools."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Пользовательские списки", callback_data="ipset:user_lists")],
+        [InlineKeyboardButton(text="⚙️ Модерируемые пулы", callback_data="mpool:list")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
+    ])
+
+
+# ── Managed Pool keyboards ─────────────────────────────────────────────────────
+
+def mpool_list_kb(pools: list) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"⚙️ {p.name}", callback_data=f"mpool:detail:{p.id}")]
+        for p in pools
+    ]
+    rows.append([InlineKeyboardButton(text="➕ Создать пул", callback_data="mpool:add")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu:ip_sets")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def mpool_detail_kb(pool_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Запустить проверку", callback_data=f"mpool:scan:{pool_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"mpool:delete_confirm:{pool_id}")],
+        [InlineKeyboardButton(text="◀️ К списку пулов", callback_data="mpool:list")],
+    ])
+
+
+def mpool_delete_confirm_kb(pool_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"mpool:delete:{pool_id}")],
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"mpool:detail:{pool_id}")],
+    ])
+
+
+def mpool_ip_sets_kb(sets: list, selected: list[int]) -> InlineKeyboardMarkup:
+    """Multi-select keyboard for choosing source IP sets for a pool."""
+    rows = []
+    for s in sets:
+        mark = "✅ " if s.id in selected else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{mark}{s.tag}",
+            callback_data=f"mpool:toggle_set:{s.id}",
+        )])
+    rows.append([InlineKeyboardButton(text="✔️ Подтвердить выбор", callback_data="mpool:confirm_sets")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="mpool:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def mpool_tags_kb(tags: list[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=tag, callback_data=f"mpool:tag:{i}")]
+        for i, tag in enumerate(tags)
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="mpool:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def mpool_cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="mpool:back")],
+    ])
+
+
+def mpool_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Создать пул", callback_data="mpool:confirm_create")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="mpool:back")],
+    ])
+
+
+# ── Automation group source-type keyboards ─────────────────────────────────────
+
+def avail_source_type_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Пользовательские наборы", callback_data="avail:source:sets")],
+        [InlineKeyboardButton(text="⚙️ Модерируемый пул", callback_data="avail:source:pool")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="avail:back")],
+    ])
+
+
+def avail_pools_kb(pools: list) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"⚙️ {p.name}", callback_data=f"avail:pool:{p.id}")]
+        for p in pools
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="avail:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

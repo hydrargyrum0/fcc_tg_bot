@@ -43,6 +43,7 @@ class AutomationService:
         ip_set_ids: list[int],
         distribution: str,
         interval_minutes: int,
+        managed_pool_id: int | None = None,
     ) -> AutomationGroup:
         group = AutomationGroup(
             org_id=org_id,
@@ -51,6 +52,7 @@ class AutomationService:
             ip_set_ids=ip_set_ids,
             distribution=distribution,
             interval_minutes=interval_minutes,
+            managed_pool_id=managed_pool_id,
         )
         self._s.add(group)
         await self._s.commit()

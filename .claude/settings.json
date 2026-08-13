@@ -15,7 +15,14 @@
       "Bash(curl -sk -X POST -H 'Authorization: Bearer 30961c7975e02bcc6300513d14115258a48355da4d669c20b81015ddaf3c9183' -H 'Content-Type: application/json' -d '{\"targets\":[\"1.1.1.1\",\"8.8.8.8\",\"185.199.108.133\"],\"ports\":[\"icmp\",\"443\"]}' https://pingachock.rapeer.com:30031/api/v1/server-ping)",
       "Bash(curl -sk https://pingachock.rapeer.com:30031/docs/openapi.yaml)",
       "Bash(curl -sk -H 'Authorization: Bearer 30961c7975e02bcc6300513d14115258a48355da4d669c20b81015ddaf3c9183' https://pingachock.rapeer.com:30031/api/v1/checks?batch_id=e8d3a8b5-accc-4fca-b97a-63b46eb17436)",
-      "Bash(curl -sk https://pingachock.rapeer.com:30031/docs)"
+      "Bash(curl -sk https://pingachock.rapeer.com:30031/docs)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('services/availability_monitor.py'\\).read\\(\\)\\); print\\('availability_monitor.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('services/ip_check_service.py'\\).read\\(\\)\\); print\\('ip_check_service.py OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(curl -s \"https://pingachock.rapeer.com:30031/docs\" --max-time 15 -k)",
+      "Bash(curl -s \"https://pingachock.rapeer.com:30031/docs/openapi.yaml\" --max-time 20 -k)",
+      "Bash(not exist *)",
+      "Bash(dir docs\\\\superpowers\\\\specs)"
     ]
   }
 }
