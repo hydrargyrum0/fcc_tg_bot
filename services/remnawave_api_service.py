@@ -1,4 +1,8 @@
+import logging
+
 import aiohttp
+
+logger = logging.getLogger(__name__)
 
 
 class RemnaWaveAPIError(Exception):
@@ -149,11 +153,30 @@ async def get_vless_config_for_tag(
     """
     # Step 1: find service user by Telegram ID
     users = await get_users(panel_url, api_token)
+    if not users:
+        logger.warning("get_vless_config_for_tag: /api/users returned empty list")
+        return None
+    # Log first user's keys to help diagnose field name issues
+    logger.warning(
+        "get_vless_config_for_tag: %d users found, first user keys: %s, sample telegramId field: %r",
+        len(users),
+        list(users[0].keys()),
+        users[0].get("telegramId"),
+    )
+    # Match by int or string to handle API variations
     service_user = next(
-        (u for u in users if u.get("telegramId") == service_tg_id),
+        (u for u in users
+         if u.get("telegramId") == service_tg_id
+         or str(u.get("telegramId", "")) == str(service_tg_id)),
         None,
     )
     if not service_user:
+        # Log all telegramId values to help find the right user
+        tg_ids = [(u.get("telegramId"), u.get("username") or u.get("name") or u.get("email", "?")) for u in users[:10]]
+        logger.warning(
+            "get_vless_config_for_tag: service user tg_id=%d not found. First 10 users (tg_id, name): %s",
+            service_tg_id, tg_ids,
+        )
         return None
 
     # Step 2: find a host matching the tag
