@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -80,7 +80,7 @@ class ManagedPoolService:
         await self._s.execute(
             update(ManagedPool)
             .where(ManagedPool.id == pool_id)
-            .values(last_scanned_at=datetime.now(timezone.utc))
+            .values(last_scanned_at=datetime.utcnow())
         )
         await self._s.commit()
 
@@ -118,7 +118,7 @@ class ManagedPoolService:
 
     async def get_ips_to_check(self, pool_id: int, stale_after_minutes: int) -> list[ManagedIp]:
         """IPs that have never been checked or whose last_checked_at is stale."""
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)
+        cutoff = datetime.utcnow() - timedelta(minutes=stale_after_minutes)
         result = await self._s.execute(
             select(ManagedIp).where(
                 ManagedIp.pool_id == pool_id,
@@ -161,7 +161,7 @@ class ManagedPoolService:
         managed_ip.tls_handshake_ms = tls_handshake_ms
         managed_ip.vless_ok = vless_ok
         managed_ip.vless_speed_mbps = vless_speed_mbps
-        managed_ip.last_checked_at = datetime.now(timezone.utc)
+        managed_ip.last_checked_at = datetime.utcnow()
         await self._s.commit()
 
     async def remove_stale_ips(self, pool_id: int, current_ips: set[str]) -> int:
