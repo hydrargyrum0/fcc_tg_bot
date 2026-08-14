@@ -7,9 +7,9 @@ UI flow:
 
   mpool:add → ManagedPoolFSM:
     choosing_name
-    → choosing_ip_sets (multi-select from org IP sets)
-    → choosing_tag     (pick Remnawave host tag for VLESS config)
-    → choosing_threshold (score threshold, default 60)
+    → choosing_ip_sets  (multi-select from org IP sets)
+    → choosing_tag      (pick Remnawave host tag)
+    → choosing_threshold (score threshold 0–100, default 60)
     → choosing_interval  (re-scan interval in minutes, default 120)
     → confirming
     → mpool:confirm_create → save → back to list
@@ -300,7 +300,7 @@ async def mpool_confirm_sets(
     await state.update_data(tags=tags)
     await state.set_state(ManagedPoolFSM.choosing_tag)
     await call.message.edit_text(
-        "Выберите тег хостов для VLESS-проверки\n(конфиг берётся из первого хоста этого тега):",
+        "Выберите тег хостов Remnawave для этого пула:",
         reply_markup=mpool_tags_kb(tags),
     )
 
@@ -320,7 +320,7 @@ async def mpool_tag_chosen(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.edit_text(
         f"Тег: <b>{tag}</b>\n\n"
         "Минимальный балл для одобрения IP (0–100).\n"
-        "Рекомендуется: <b>60</b> — только адреса с рабочим VLESS и хорошим пингом.\n\n"
+        "Рекомендуется: <b>60</b> — адреса с рабочим TLS и низкими потерями пакетов.\n\n"
         "Введите число или /skip для значения по умолчанию (60):",
         reply_markup=mpool_cancel_kb(),
         parse_mode="HTML",
@@ -371,33 +371,6 @@ async def mpool_got_interval(message: Message, state: FSMContext) -> None:
             )
             return
     await state.update_data(interval=interval)
-    await state.set_state(ManagedPoolFSM.choosing_vless_uuid)
-    await message.answer(
-        f"Интервал: <b>{interval} мин</b>\n\n"
-        "Введите <b>Short UUID</b> сервисного пользователя Remnawave для VLESS-тестов.\n"
-        "Найдите его в панели: профиль пользователя → поле «Short UUID».\n\n"
-        "Например: <code>1sMCFP-Jd-5CSr7r</code>\n\n"
-        "Или введите /skip чтобы пропустить VLESS-тесты (только ping + TLS):",
-        reply_markup=mpool_cancel_kb(),
-        parse_mode="HTML",
-    )
-
-
-@router.message(ManagedPoolFSM.choosing_vless_uuid)
-async def mpool_got_vless_uuid(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if text == "/skip":
-        vless_uuid: str | None = None
-    elif len(text) > 50 or len(text) < 5:
-        await message.answer(
-            "Short UUID должен быть от 5 до 50 символов.\n"
-            "Введите корректный UUID или /skip:",
-            reply_markup=mpool_cancel_kb(),
-        )
-        return
-    else:
-        vless_uuid = text
-    await state.update_data(vless_service_short_uuid=vless_uuid)
     await state.set_state(ManagedPoolFSM.confirming)
     await _show_pool_confirm(message, state)
 
@@ -410,18 +383,15 @@ async def _show_pool_confirm(target: Message | CallbackQuery, state: FSMContext)
     selected_ids: list[int] = data.get("selected_set_ids", [])
     threshold: float = data.get("threshold", 60.0)
     interval: int = data.get("interval", 120)
-    vless_short_uuid: str | None = data.get("vless_service_short_uuid")
 
     selected_sets = [s for s in sets_info if s["id"] in selected_ids]
     sets_label = ", ".join(s["tag"] for s in selected_sets) or "—"
-    vless_label = f"<code>{vless_short_uuid}</code>" if vless_short_uuid else "не задан (ping+TLS только)"
 
     text = (
         f"✅ <b>Готово к созданию</b>\n\n"
         f"Название: <b>{name}</b>\n"
         f"Наборы IP: <b>{sets_label}</b>\n"
         f"Тег хостов: <b>{host_tag}</b>\n"
-        f"VLESS UUID: {vless_label}\n"
         f"Порог одобрения: <b>{threshold:.0f}</b>\n"
         f"Интервал проверки: <b>{interval} мин</b>"
     )
@@ -447,7 +417,6 @@ async def mpool_confirm_create(
         ip_set_ids=data.get("selected_set_ids", []),
         score_threshold=data.get("threshold", 60.0),
         check_interval_minutes=data.get("interval", 120),
-        vless_service_short_uuid=data.get("vless_service_short_uuid"),
     )
     await state.clear()
     send_audit(call.bot, active_org.id, db_user, f"Создал управляемый пул: {pool.name}")
@@ -498,7 +467,7 @@ async def mpool_back(
         tags = data.get("tags", [])
         await state.set_state(ManagedPoolFSM.choosing_tag)
         await call.message.edit_text(
-            "Выберите тег хостов для VLESS-проверки:",
+            "Выберите тег хостов Remnawave для этого пула:",
             reply_markup=mpool_tags_kb(tags),
         )
 
@@ -510,18 +479,11 @@ async def mpool_back(
             reply_markup=mpool_cancel_kb(),
         )
 
-    elif current == ManagedPoolFSM.choosing_vless_uuid:
+    elif current == ManagedPoolFSM.confirming:
         interval = data.get("interval", 120)
         await state.set_state(ManagedPoolFSM.choosing_interval)
         await call.message.edit_text(
             f"Текущий интервал: {interval} мин\n\nВведите число ≥ 30 или /skip для 120:",
-            reply_markup=mpool_cancel_kb(),
-        )
-
-    elif current == ManagedPoolFSM.confirming:
-        await state.set_state(ManagedPoolFSM.choosing_vless_uuid)
-        await call.message.edit_text(
-            "Введите Short UUID сервисного пользователя для VLESS-тестов или /skip:",
             reply_markup=mpool_cancel_kb(),
         )
 
