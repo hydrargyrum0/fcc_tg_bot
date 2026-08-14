@@ -1,9 +1,8 @@
 """Background scorer: Управляемый пул IP-адресов.
 
 Периодически перепроверяет IP из пользовательских наборов через Pingachock:
-  ping  — задержка и потери
-  tls   — время TLS-хендшейка на kremnezar.online:443
-  vless — работоспособность и скорость VPN через конфиг тега хостов
+  tls  — TLS-хендшейк на kremnezar.online:443 (ворота — без TLS IP не принимается)
+  ping — задержка и потери (влияет на приоритет: меньше потерь = выше score)
 
 Итоговый score (0–100) определяет is_approved для каждого IP.
 Запускается через asyncio.create_task() в main.py.
@@ -11,7 +10,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -26,8 +24,6 @@ from services.ip_set_service import IpSetService
 from services.managed_pool_service import ManagedPoolService
 from services.pingachock_api_service import PingachockAPIError, create_check, get_check
 from services.pingachock_service import PingachockService
-from services.remnawave_api_service import RemnaWaveAPIError, get_vless_config_for_tag
-from services.remnawave_service import RemnaWaveService
 
 logger = logging.getLogger(__name__)
 
@@ -41,75 +37,36 @@ _scoring_pools: set[int] = set()   # pool IDs currently being scored (in-flight 
 
 # ── scoring formula ───────────────────────────────────────────────────────────
 
-def _ping_score(rtt_ms: float | None, loss_pct: float | None) -> float:
-    """0–30 points for ping quality."""
-    loss = (loss_pct or 0.0) * 100  # convert fraction → percentage
-    if loss > 50:
-        return 0.0
-    if rtt_ms is None:
-        return 10.0   # reachable but RTT unknown — neutral
-    if rtt_ms > 300:
-        base = 5.0
-    elif rtt_ms > 150:
-        base = 15.0
-    elif rtt_ms > 80:
-        base = 22.0
-    else:
-        base = 30.0
-    # deduct 1pt per 5% loss
-    return max(0.0, base - loss / 5)
-
-
-def _tls_score(tls_ok: bool | None, tls_ms: float | None) -> float:
-    """0–20 points for TLS handshake quality."""
-    if not tls_ok:
-        return 0.0
-    if tls_ms is None:
-        return 10.0   # TLS succeeded but no timing — neutral
-    if tls_ms > 1000:
-        return 5.0
-    if tls_ms > 500:
-        return 10.0
-    if tls_ms > 200:
-        return 15.0
-    return 20.0
-
-
-def _vless_score(speed_mbps: float | None) -> float:
-    """0–50 points for VLESS connection speed."""
-    if speed_mbps is None:
-        return 0.0
-    if speed_mbps < 1:
-        return 5.0
-    if speed_mbps < 5:
-        return 15.0
-    if speed_mbps < 15:
-        return 30.0
-    if speed_mbps < 30:
-        return 40.0
-    return 50.0
-
-
 def compute_score(
-    ping_reachable: bool,
-    ping_rtt_ms: float | None,
-    ping_loss_pct: float | None,
     tls_ok: bool | None,
     tls_handshake_ms: float | None,
-    vless_ok: bool | None,
-    vless_speed_mbps: float | None,
+    ping_loss_pct: float | None,
+    ping_rtt_ms: float | None,
 ) -> float:
-    """0–100 score for an IP. 0 if unreachable via ping."""
-    if not ping_reachable:
+    """TLS is the gate — no TLS means score 0 (rejected).
+
+    Range 0–100; default threshold 60 separates approved from rejected.
+      • tls_ok = False / None  →  0   (confirmed fail or timeout)
+      • tls_ok = True          →  base 70, +bonus for RTT, −penalty for loss
+        - loss > 50 %          →  30  (below threshold — rejected)
+        - 0 % loss, RTT < 80ms →  85
+        - 0 % loss, any RTT    →  70–85
+    """
+    if not tls_ok:          # False or None (timed out — don't know yet)
         return 0.0
-    if not vless_ok:
-        # VLESS not working — partial credit for network quality only
-        return _ping_score(ping_rtt_ms, ping_loss_pct) * 0.5 + _tls_score(tls_ok, tls_handshake_ms) * 0.25
-    return (
-        _ping_score(ping_rtt_ms, ping_loss_pct)
-        + _tls_score(tls_ok, tls_handshake_ms)
-        + _vless_score(vless_speed_mbps)
-    )
+    loss = (ping_loss_pct or 0.0) * 100    # fraction 0–1 → percent 0–100
+    if loss > 50:
+        return 30.0         # very lossy — below default threshold
+    loss_penalty = loss * 0.6              # 50 % → −30 pts
+    rtt_bonus = 0.0
+    if ping_rtt_ms is not None:
+        if ping_rtt_ms < 80:
+            rtt_bonus = 15.0
+        elif ping_rtt_ms < 150:
+            rtt_bonus = 10.0
+        elif ping_rtt_ms < 300:
+            rtt_bonus = 5.0
+    return min(100.0, 70.0 - loss_penalty + rtt_bonus)
 
 
 # ── TLS batch check ───────────────────────────────────────────────────────────
@@ -174,74 +131,6 @@ async def _tls_check_batch(
                 break
         results[ip] = (ok, rtt)
     return results
-
-
-# ── VLESS single-IP check ─────────────────────────────────────────────────────
-
-async def _vless_check_ip(
-    api_url: str,
-    api_key: str,
-    ip: str,
-    vless_template: dict,
-    poll_timeout: float = POLL_TIMEOUT,
-    poll_interval: float = _CHECK_POLL_INTERVAL,  # 5 s
-) -> tuple[bool | None, float | None]:
-    """VLESS speedtest for a single IP.
-
-    Substitutes test IP into the template outbound and submits to Pingachock.
-    Returns (ok, speed_mbps_or_None).
-    """
-    config = copy.deepcopy(vless_template)
-    try:
-        config["settings"]["vnext"][0]["address"] = ip
-    except (KeyError, IndexError):
-        logger.warning("VLESS template has unexpected structure, cannot set address")
-        return False, None
-
-    try:
-        resp = await create_check(
-            api_url, api_key, "vless", {"all": True},
-            targets=[ip],
-            params={"config": config},
-        )
-    except PingachockAPIError as e:
-        logger.debug("VLESS check create failed for %s: %s", ip, e)
-        return False, None
-
-    check_id: str | None = None
-    for c in resp.get("checks", []):
-        check_id = c["id"]
-        break
-    if not check_id:
-        return False, None
-
-    batch_id = resp.get("batch_id")
-    await poll_batch(api_url, api_key, batch_id, {check_id}, poll_timeout, poll_interval)
-
-    try:
-        check_data = await get_check(api_url, api_key, check_id, expand="runs")
-    except PingachockAPIError:
-        return False, None
-
-    status = check_data.get("status")
-    if status not in ("completed", "partial", "failed", "cancelled"):
-        return None, None   # timed out — unknown, not failed
-    ok = status in ("completed", "partial")
-    speed: float | None = None
-    for run in check_data.get("runs", []):
-        raw = (run.get("result") or {}).get("raw") or {}
-        # Pingachock may report speed under various field names
-        for key in ("download_mbps", "speed_mbps", "download_speed", "mbps", "speed"):
-            val = raw.get(key)
-            if val is not None:
-                try:
-                    speed = float(val)
-                except (ValueError, TypeError):
-                    pass
-                break
-        if speed is not None:
-            break
-    return ok, speed
 
 
 # ── main pool scoring loop ────────────────────────────────────────────────────
@@ -310,20 +199,12 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
         ip_svc = IpSetService(session)
         sets = await ip_svc.get_sets_by_ids(list(pool.ip_set_ids))
 
-        rw_svc = RemnaWaveService(session)
-        panels = await rw_svc.get_org_panels(pool.org_id)
-
         pc_svc = PingachockService(session)
         pc = await pc_svc.get_settings(pool.org_id)
 
     if not pc:
         logger.warning("Pool %d: Pingachock not configured for org %d", pool_id, pool.org_id)
         return
-    if not panels:
-        logger.warning("Pool %d: no Remnawave panels for org %d", pool_id, pool.org_id)
-        return
-
-    panel = panels[0]  # use first panel for VLESS config
 
     # ── 2. Build deduplicated IP list from source sets ────────────────────────
     seen_ips: set[str] = set()
@@ -353,25 +234,7 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
             await pool_svc.upsert_ip(pool_id, ip)
         await session.commit()  # flush() inside upsert_ip is not enough — must commit
 
-    # ── 4. Get VLESS config template ──────────────────────────────────────────
-    vless_template: dict | None = None
-    if not pool.vless_service_short_uuid:
-        logger.info(
-            "Pool %d: no vless_service_short_uuid configured — skipping VLESS checks", pool_id
-        )
-    else:
-        try:
-            vless_template = await get_vless_config_for_tag(
-                panel.url, panel.api_token, pool.vless_service_short_uuid, pool.host_tag,
-            )
-            if vless_template:
-                logger.debug(
-                    "Pool %d: VLESS config template loaded for tag '%s'", pool_id, pool.host_tag
-                )
-        except RemnaWaveAPIError as e:
-            logger.warning("Pool %d: could not get VLESS config: %s", pool_id, e)
-
-    # ── 5. Fetch IPs that need checking ──────────────────────────────────────
+    # ── 4. Fetch IPs that need checking ──────────────────────────────────────
     async with session_factory() as session:
         pool_svc = ManagedPoolService(session)
         pool_obj = await pool_svc.get_pool_any(pool_id)
@@ -434,35 +297,19 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
         else:
             tls_batch = tls_res_or_exc
 
-        # VLESS: sequential per reachable IP (speed tests are heavy — one at a time)
-        vless_batch: dict[str, tuple[bool | None, float | None]] = {}
-        if vless_template:
-            for ip in batch:
-                if ping_batch.get(ip, (None,))[0] is True:
-                    vok, spd = await _vless_check_ip(pc.api_url, pc.api_key, ip, vless_template)
-                    vless_batch[ip] = (vok, spd)
-                    logger.debug(
-                        "Pool %d: %s vless=%s speed=%s Mbps", pool_id, ip, vok, spd
-                    )
-        elif batch_num == 1:
-            logger.info("Pool %d: skipping VLESS checks (no template available)", pool_id)
-
         # Write scores for this batch immediately → UI fills up progressively
         async with session_factory() as session:
             pool_svc = ManagedPoolService(session)
             for ip in batch:
-                ping_ok, ping_rtt, ping_loss = ping_batch.get(ip, (None, None, None))
-                if ping_ok is None:
-                    # Timed out — preserve existing score, re-check next cycle
+                tls_ok, tls_ms = tls_batch.get(ip, (None, None))
+                if tls_ok is None:
+                    # TLS timed out — don't know yet, preserve score, retry next cycle
                     logger.debug(
-                        "Pool %d: skip %s — ping timed out, preserving score", pool_id, ip
+                        "Pool %d: skip %s — TLS timed out, preserving score", pool_id, ip
                     )
                     continue
-                tls_ok, tls_ms = tls_batch.get(ip, (None, None))
-                vless_ok, vless_speed = vless_batch.get(ip, (None, None))
-                score = compute_score(
-                    ping_ok, ping_rtt, ping_loss, tls_ok, tls_ms, vless_ok, vless_speed
-                )
+                ping_ok, ping_rtt, ping_loss = ping_batch.get(ip, (None, None, None))
+                score = compute_score(tls_ok, tls_ms, ping_loss, ping_rtt)
                 approved = score >= threshold
 
                 result = await session.execute(
@@ -474,7 +321,8 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
                 if managed:
                     await pool_svc.update_ip_score(
                         managed, score, approved,
-                        ping_rtt, ping_loss, tls_ok, tls_ms, vless_ok, vless_speed,
+                        ping_rtt, ping_loss, tls_ok, tls_ms,
+                        vless_ok=None, vless_speed_mbps=None,
                     )
                     if approved:
                         approved_count += 1
