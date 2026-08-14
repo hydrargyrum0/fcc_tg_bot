@@ -109,17 +109,22 @@ async def mpool_detail(
     approved = stats["approved"]
     pct = f"{approved / total * 100:.0f}%" if total else "—"
 
-    await call.message.edit_text(
-        f"⚙️ <b>Пул «{pool.name}»</b>\n\n"
-        f"Источники: <b>{sets_label}</b>\n"
-        f"Тег хостов: <b>{pool.host_tag}</b>\n"
-        f"Порог: {pool.score_threshold:.0f} | Интервал: {pool.check_interval_minutes} мин\n\n"
-        f"📊 Всего: {total} | Одобрено: {approved} ({pct}) | "
-        f"Ожидают: {stats['pending']} | Отклонено: {stats['rejected']}\n\n"
-        f"Последняя проверка: {last}",
-        reply_markup=mpool_detail_kb(pool_id),
-        parse_mode="HTML",
-    )
+    from aiogram.exceptions import TelegramBadRequest
+    try:
+        await call.message.edit_text(
+            f"⚙️ <b>Пул «{pool.name}»</b>\n\n"
+            f"Источники: <b>{sets_label}</b>\n"
+            f"Тег хостов: <b>{pool.host_tag}</b>\n"
+            f"Порог: {pool.score_threshold:.0f} | Интервал: {pool.check_interval_minutes} мин\n\n"
+            f"📊 Всего: {total} | Одобрено: {approved} ({pct}) | "
+            f"Ожидают: {stats['pending']} | Отклонено: {stats['rejected']}\n\n"
+            f"Последняя проверка: {last}",
+            reply_markup=mpool_detail_kb(pool_id),
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
 
 
 # ── manual scan trigger ───────────────────────────────────────────────────────
