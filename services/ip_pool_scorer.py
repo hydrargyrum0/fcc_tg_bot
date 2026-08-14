@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from db.models.managed_pool import ManagedIp, ManagedPool
 from services.ip_check_service import (
-    CHECK_BATCH, POLL_INTERVAL, POLL_TIMEOUT,
+    CHECK_BATCH, POLL_INTERVAL as _CHECK_POLL_INTERVAL, POLL_TIMEOUT,
     distributed_ping_check, normalize_addresses, poll_batch,
 )
 from services.ip_set_service import IpSetService
@@ -31,9 +31,10 @@ from services.remnawave_service import RemnaWaveService
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 60          # seconds between "which pools are due?" wakeups
+SCORER_WAKEUP_INTERVAL = 60  # seconds between "which pools are due?" wakeups
 TLS_TARGET = "kremnezar.online"
 TLS_PORT = 443
+POOL_SCORE_BATCH = 50        # IPs per Pingachock batch for pool scoring (vs CHECK_BATCH=5 for monitor)
 
 _scoring_pools: set[int] = set()   # pool IDs currently being scored (in-flight guard)
 
@@ -118,7 +119,7 @@ async def _tls_check_batch(
     api_key: str,
     ips: list[str],
     poll_timeout: float = POLL_TIMEOUT,
-    poll_interval: float = POLL_INTERVAL,
+    poll_interval: float = _CHECK_POLL_INTERVAL,  # 5 s — same cadence as ping poller
 ) -> dict[str, tuple[bool | None, float | None]]:
     """TLS handshake check against TLS_TARGET:TLS_PORT for each IP.
 
@@ -183,7 +184,7 @@ async def _vless_check_ip(
     ip: str,
     vless_template: dict,
     poll_timeout: float = POLL_TIMEOUT,
-    poll_interval: float = POLL_INTERVAL,
+    poll_interval: float = _CHECK_POLL_INTERVAL,  # 5 s
 ) -> tuple[bool | None, float | None]:
     """VLESS speedtest for a single IP.
 
@@ -250,7 +251,7 @@ async def run_ip_pool_scorer(session_factory: async_sessionmaker) -> None:
     logger.info("IP pool scorer started")
     while True:
         try:
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(SCORER_WAKEUP_INTERVAL)
         except asyncio.CancelledError:
             logger.info("IP pool scorer cancelled")
             return
@@ -375,6 +376,7 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
         pool_svc = ManagedPoolService(session)
         pool_obj = await pool_svc.get_pool_any(pool_id)
         interval = pool_obj.check_interval_minutes if pool_obj else 120
+        threshold = pool_obj.score_threshold if pool_obj else 60.0
         to_check = await pool_svc.get_ips_to_check(pool_id, interval)
 
     if not to_check:
@@ -383,78 +385,102 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
             await ManagedPoolService(session).mark_scanned(pool_id)
         return
 
-    logger.info("Pool %d: checking %d/%d IPs", pool_id, len(to_check), len(unique_ips))
     check_ips = [m.ip for m in to_check]
-    id_map = {m.id: m for m in to_check}
+    total_batches = (len(check_ips) + POOL_SCORE_BATCH - 1) // POOL_SCORE_BATCH
+    logger.info(
+        "Pool %d: checking %d/%d IPs in %d batches of %d",
+        pool_id, len(check_ips), len(unique_ips), total_batches, POOL_SCORE_BATCH,
+    )
 
-    # ── 6. Ping check (batched) ───────────────────────────────────────────────
-    ping_results: dict[str, tuple[bool, float | None, float | None]] = {}
-    for i in range(0, len(check_ips), CHECK_BATCH):
-        batch = check_ips[i: i + CHECK_BATCH]
-        try:
-            batch_results = await distributed_ping_check(pc.api_url, pc.api_key, batch)
-            ping_results.update(batch_results)
-        except PingachockAPIError as e:
-            logger.warning("Pool %d: ping batch %d failed: %s", pool_id, i // CHECK_BATCH, e)
-            for ip in batch:
-                ping_results[ip] = (False, None, None)
-
-    # ── 7. TLS check (batched) ────────────────────────────────────────────────
-    tls_results: dict[str, tuple[bool, float | None]] = {}
-    for i in range(0, len(check_ips), CHECK_BATCH):
-        batch = check_ips[i: i + CHECK_BATCH]
-        batch_tls = await _tls_check_batch(pc.api_url, pc.api_key, batch)
-        tls_results.update(batch_tls)
-
-    # ── 8. VLESS check (sequential, only reachable IPs) ──────────────────────
-    vless_results: dict[str, tuple[bool, float | None]] = {}
-    if vless_template:
-        reachable = [ip for ip in check_ips if ping_results.get(ip, (None,))[0] is True]
-        for ip in reachable:
-            vless_ok, speed = await _vless_check_ip(pc.api_url, pc.api_key, ip, vless_template)
-            vless_results[ip] = (vless_ok, speed)
-            logger.debug("Pool %d: %s vless=%s speed=%s Mbps", pool_id, ip, vless_ok, speed)
-    else:
-        logger.info("Pool %d: skipping VLESS checks (no template available)", pool_id)
-
-    # ── 9. Compute scores and persist ─────────────────────────────────────────
+    # ── 6–9. Per-batch: ping+TLS parallel → VLESS → commit → next batch ──────
+    # Ping and TLS run in parallel (independent checks).
+    # Scores are written after each batch so the UI fills up progressively.
+    # VLESS speedtests run sequentially within each batch (heavy — one at a time).
+    from sqlalchemy import select as _select
     approved_count = 0
-    async with session_factory() as session:
-        pool_svc = ManagedPoolService(session)
-        threshold_pool = await pool_svc.get_pool_any(pool_id)
-        threshold = threshold_pool.score_threshold if threshold_pool else 60.0
 
-        from sqlalchemy import select as _select
-        for managed_ip in to_check:
-            ip = managed_ip.ip
-            ping_ok, ping_rtt, ping_loss = ping_results.get(ip, (None, None, None))
+    for batch_num, batch_start in enumerate(range(0, len(check_ips), POOL_SCORE_BATCH), 1):
+        batch = check_ips[batch_start: batch_start + POOL_SCORE_BATCH]
 
-            if ping_ok is None:
-                # Ping check timed out — we don't know the state.
-                # Preserve existing score/approved; re-check next cycle.
-                logger.debug("Pool %d: skip %s — ping timed out, preserving score", pool_id, ip)
-                continue
+        logger.debug(
+            "Pool %d: batch %d/%d — %d IPs",
+            pool_id, batch_num, total_batches, len(batch),
+        )
 
-            tls_ok, tls_ms = tls_results.get(ip, (None, None))
-            vless_ok, vless_speed = vless_results.get(ip, (None, None))
+        # Ping + TLS in parallel — independent, no need to wait for each other
+        ping_res_or_exc, tls_res_or_exc = await asyncio.gather(
+            distributed_ping_check(pc.api_url, pc.api_key, batch),
+            _tls_check_batch(pc.api_url, pc.api_key, batch),
+            return_exceptions=True,
+        )
 
-            score = compute_score(ping_ok, ping_rtt, ping_loss, tls_ok, tls_ms, vless_ok, vless_speed)
-            approved = score >= threshold
-
-            # Re-fetch object in the current session before updating
-            result = await session.execute(
-                _select(ManagedIp).where(ManagedIp.id == managed_ip.id)
+        if isinstance(ping_res_or_exc, Exception):
+            logger.warning(
+                "Pool %d: batch %d/%d ping error: %s", pool_id, batch_num, total_batches, ping_res_or_exc
             )
-            fresh = result.scalar_one_or_none()
-            if fresh:
-                await pool_svc.update_ip_score(
-                    fresh, score, approved,
-                    ping_rtt, ping_loss, tls_ok, tls_ms, vless_ok, vless_speed,
-                )
-                if approved:
-                    approved_count += 1
+            ping_batch: dict[str, tuple[bool | None, float | None, float | None]] = {
+                ip: (None, None, None) for ip in batch
+            }
+        else:
+            ping_batch = ping_res_or_exc
 
-        await pool_svc.mark_scanned(pool_id)
+        if isinstance(tls_res_or_exc, Exception):
+            logger.warning(
+                "Pool %d: batch %d/%d TLS error: %s", pool_id, batch_num, total_batches, tls_res_or_exc
+            )
+            tls_batch: dict[str, tuple[bool | None, float | None]] = {
+                ip: (None, None) for ip in batch
+            }
+        else:
+            tls_batch = tls_res_or_exc
+
+        # VLESS: sequential per reachable IP (speed tests are heavy — one at a time)
+        vless_batch: dict[str, tuple[bool | None, float | None]] = {}
+        if vless_template:
+            for ip in batch:
+                if ping_batch.get(ip, (None,))[0] is True:
+                    vok, spd = await _vless_check_ip(pc.api_url, pc.api_key, ip, vless_template)
+                    vless_batch[ip] = (vok, spd)
+                    logger.debug(
+                        "Pool %d: %s vless=%s speed=%s Mbps", pool_id, ip, vok, spd
+                    )
+        elif batch_num == 1:
+            logger.info("Pool %d: skipping VLESS checks (no template available)", pool_id)
+
+        # Write scores for this batch immediately → UI fills up progressively
+        async with session_factory() as session:
+            pool_svc = ManagedPoolService(session)
+            for ip in batch:
+                ping_ok, ping_rtt, ping_loss = ping_batch.get(ip, (None, None, None))
+                if ping_ok is None:
+                    # Timed out — preserve existing score, re-check next cycle
+                    logger.debug(
+                        "Pool %d: skip %s — ping timed out, preserving score", pool_id, ip
+                    )
+                    continue
+                tls_ok, tls_ms = tls_batch.get(ip, (None, None))
+                vless_ok, vless_speed = vless_batch.get(ip, (None, None))
+                score = compute_score(
+                    ping_ok, ping_rtt, ping_loss, tls_ok, tls_ms, vless_ok, vless_speed
+                )
+                approved = score >= threshold
+
+                result = await session.execute(
+                    _select(ManagedIp).where(
+                        ManagedIp.pool_id == pool_id, ManagedIp.ip == ip
+                    )
+                )
+                managed = result.scalar_one_or_none()
+                if managed:
+                    await pool_svc.update_ip_score(
+                        managed, score, approved,
+                        ping_rtt, ping_loss, tls_ok, tls_ms, vless_ok, vless_speed,
+                    )
+                    if approved:
+                        approved_count += 1
+
+    async with session_factory() as session:
+        await ManagedPoolService(session).mark_scanned(pool_id)
 
     logger.info(
         "Pool %d: done — %d/%d approved (threshold %.0f)",
