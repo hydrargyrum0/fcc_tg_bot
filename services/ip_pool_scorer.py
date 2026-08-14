@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -250,25 +251,23 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
 
     check_ips = [m.ip for m in to_check]
     total_batches = (len(check_ips) + POOL_SCORE_BATCH - 1) // POOL_SCORE_BATCH
+    scorer_start = time.monotonic()
     logger.info(
-        "Pool %d: checking %d/%d IPs in %d batches of %d",
-        pool_id, len(check_ips), len(unique_ips), total_batches, POOL_SCORE_BATCH,
+        "Pool %d «%s»: starting — %d/%d IPs to check, %d batches of ≤%d, threshold=%.0f",
+        pool_id, pool.name, len(check_ips), len(unique_ips),
+        total_batches, POOL_SCORE_BATCH, threshold,
     )
 
-    # ── 6–9. Per-batch: ping+TLS parallel → VLESS → commit → next batch ──────
+    # ── 6–9. Per-batch: ping+TLS parallel → commit → next batch ──────────────
     # Ping and TLS run in parallel (independent checks).
     # Scores are written after each batch so the UI fills up progressively.
-    # VLESS speedtests run sequentially within each batch (heavy — one at a time).
     from sqlalchemy import select as _select
     approved_count = 0
+    skipped_count  = 0   # TLS timed out
 
     for batch_num, batch_start in enumerate(range(0, len(check_ips), POOL_SCORE_BATCH), 1):
         batch = check_ips[batch_start: batch_start + POOL_SCORE_BATCH]
-
-        logger.debug(
-            "Pool %d: batch %d/%d — %d IPs",
-            pool_id, batch_num, total_batches, len(batch),
-        )
+        batch_t0 = time.monotonic()
 
         # Ping + TLS in parallel — independent, no need to wait for each other
         ping_res_or_exc, tls_res_or_exc = await asyncio.gather(
@@ -279,7 +278,8 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
 
         if isinstance(ping_res_or_exc, Exception):
             logger.warning(
-                "Pool %d: batch %d/%d ping error: %s", pool_id, batch_num, total_batches, ping_res_or_exc
+                "Pool %d: batch %d/%d — ping RPC failed: %s",
+                pool_id, batch_num, total_batches, ping_res_or_exc,
             )
             ping_batch: dict[str, tuple[bool | None, float | None, float | None]] = {
                 ip: (None, None, None) for ip in batch
@@ -289,7 +289,8 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
 
         if isinstance(tls_res_or_exc, Exception):
             logger.warning(
-                "Pool %d: batch %d/%d TLS error: %s", pool_id, batch_num, total_batches, tls_res_or_exc
+                "Pool %d: batch %d/%d — TLS RPC failed: %s",
+                pool_id, batch_num, total_batches, tls_res_or_exc,
             )
             tls_batch: dict[str, tuple[bool | None, float | None]] = {
                 ip: (None, None) for ip in batch
@@ -297,20 +298,50 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
         else:
             tls_batch = tls_res_or_exc
 
+        # Per-batch counters for the summary log line
+        b_tls_ok = b_tls_fail = b_tls_timeout = 0
+        b_ping_ok = b_ping_fail = b_ping_timeout = 0
+        b_approved = b_rejected = b_skipped = 0
+
         # Write scores for this batch immediately → UI fills up progressively
         async with session_factory() as session:
             pool_svc = ManagedPoolService(session)
             for ip in batch:
                 tls_ok, tls_ms = tls_batch.get(ip, (None, None))
-                if tls_ok is None:
-                    # TLS timed out — don't know yet, preserve score, retry next cycle
-                    logger.debug(
-                        "Pool %d: skip %s — TLS timed out, preserving score", pool_id, ip
-                    )
-                    continue
                 ping_ok, ping_rtt, ping_loss = ping_batch.get(ip, (None, None, None))
+
+                # Count ping result
+                if ping_ok is True:   b_ping_ok += 1
+                elif ping_ok is False: b_ping_fail += 1
+                else:                 b_ping_timeout += 1
+
+                # Count TLS result
+                if tls_ok is True:   b_tls_ok += 1
+                elif tls_ok is False: b_tls_fail += 1
+                else:                 b_tls_timeout += 1
+
+                if tls_ok is None:
+                    # TLS timed out — preserve existing score, retry next cycle
+                    b_skipped += 1
+                    skipped_count += 1
+                    logger.debug("Pool %d: %s — TLS timeout, score preserved", pool_id, ip)
+                    continue
+
                 score = compute_score(tls_ok, tls_ms, ping_loss, ping_rtt)
                 approved = score >= threshold
+
+                # Debug line per IP (only visible at DEBUG log level)
+                logger.debug(
+                    "Pool %d: %s — TLS=%s(%s) ping=%s(RTT=%s loss=%s) → score=%.0f %s",
+                    pool_id, ip,
+                    "OK" if tls_ok else "FAIL",
+                    f"{tls_ms:.0f}ms" if tls_ms is not None else "?",
+                    "OK" if ping_ok else ("FAIL" if ping_ok is False else "?"),
+                    f"{ping_rtt:.0f}ms" if ping_rtt is not None else "?",
+                    f"{ping_loss * 100:.0f}%" if ping_loss is not None else "?",
+                    score,
+                    "✓ APPROVED" if approved else "✗ REJECTED",
+                )
 
                 result = await session.execute(
                     _select(ManagedIp).where(
@@ -326,11 +357,29 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
                     )
                     if approved:
                         approved_count += 1
+                        b_approved += 1
+                    else:
+                        b_rejected += 1
+
+        elapsed_batch = time.monotonic() - batch_t0
+        logger.info(
+            "Pool %d: batch %d/%d [%.0fs] — "
+            "ping: %d✓ %d✗ %d? | TLS: %d✓ %d✗ %d? | approved: %d/%d",
+            pool_id, batch_num, total_batches, elapsed_batch,
+            b_ping_ok, b_ping_fail, b_ping_timeout,
+            b_tls_ok, b_tls_fail, b_tls_timeout,
+            b_approved, len(batch) - b_skipped,
+        )
 
     async with session_factory() as session:
         await ManagedPoolService(session).mark_scanned(pool_id)
 
+    elapsed_total = time.monotonic() - scorer_start
+    m, s = divmod(int(elapsed_total), 60)
     logger.info(
-        "Pool %d: done — %d/%d approved (threshold %.0f)",
-        pool_id, approved_count, len(check_ips), threshold,
+        "Pool %d «%s»: done in %dm%02ds — "
+        "%d/%d approved (threshold %.0f)%s",
+        pool_id, pool.name, m, s,
+        approved_count, len(check_ips), threshold,
+        f", {skipped_count} skipped (TLS timeout, will retry)" if skipped_count else "",
     )

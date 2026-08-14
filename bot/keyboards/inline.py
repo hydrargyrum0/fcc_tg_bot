@@ -657,6 +657,7 @@ def mpool_list_kb(pools: list) -> InlineKeyboardMarkup:
 def mpool_detail_kb(pool_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Запустить проверку", callback_data=f"mpool:scan:{pool_id}")],
+        [InlineKeyboardButton(text="📋 Список адресов", callback_data=f"mpool:ips:{pool_id}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"mpool:delete_confirm:{pool_id}")],
         [InlineKeyboardButton(text="◀️ К списку пулов", callback_data="mpool:list")],
     ])

@@ -109,6 +109,19 @@ class ManagedPoolService:
         rejected = total - approved - pending
         return {"total": total, "approved": approved, "pending": pending, "rejected": rejected}
 
+    async def get_all_ips(self, pool_id: int) -> list[ManagedIp]:
+        """All IPs for the pool: approved first (score desc), then pending, then rejected."""
+        result = await self._s.execute(
+            select(ManagedIp)
+            .where(ManagedIp.pool_id == pool_id)
+            .order_by(
+                ManagedIp.is_approved.desc(),
+                ManagedIp.score.desc().nullslast(),
+                ManagedIp.ip,
+            )
+        )
+        return list(result.scalars().all())
+
     async def get_approved_ips(self, pool_id: int) -> list[ManagedIp]:
         """Approved IPs sorted by score descending — used by availability monitor."""
         result = await self._s.execute(

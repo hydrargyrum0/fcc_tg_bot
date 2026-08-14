@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -144,6 +144,69 @@ async def mpool_scan(
     await call.answer(
         "🔄 Проверка будет запущена в течение минуты. Результаты появятся через несколько минут.",
         show_alert=True,
+    )
+
+
+# ── ip list export ───────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.regexp(r"^mpool:ips:\d+$"))
+async def mpool_ips(
+    call: CallbackQuery, session: AsyncSession, active_org: Organization,
+) -> None:
+    await call.answer()
+    pool_id = int(call.data.split(":")[2])
+    svc = ManagedPoolService(session)
+    pool = await svc.get_pool(pool_id, active_org.id)
+    if not pool:
+        await call.answer("Пул не найден.", show_alert=True)
+        return
+
+    all_ips = await svc.get_all_ips(pool_id)
+    if not all_ips:
+        await call.answer("Пул пуст — нет ни одного адреса.", show_alert=True)
+        return
+
+    from datetime import datetime, timezone as _tz
+    now = datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    approved  = [ip for ip in all_ips if ip.is_approved]
+    pending   = [ip for ip in all_ips if ip.last_checked_at is None]
+    rejected  = [ip for ip in all_ips if not ip.is_approved and ip.last_checked_at is not None]
+
+    lines: list[str] = [
+        f"Пул «{pool.name}»  |  {now}",
+        f"Тег: {pool.host_tag}  |  Порог: {pool.score_threshold:.0f}  |  Интервал: {pool.check_interval_minutes} мин",
+        f"Всего: {len(all_ips)}  |  Одобрено: {len(approved)}  |  Ожидают: {len(pending)}  |  Отклонено: {len(rejected)}",
+        "",
+    ]
+
+    def _fmt(ip) -> str:
+        score = f"score={ip.score:.0f}" if ip.score is not None else "score=—"
+        tls   = "TLS=✓" if ip.tls_ok else ("TLS=✗" if ip.tls_ok is False else "TLS=?")
+        rtt   = f"RTT={ip.ping_rtt_ms:.0f}ms" if ip.ping_rtt_ms is not None else "RTT=?"
+        loss  = f"loss={ip.ping_loss_pct * 100:.0f}%" if ip.ping_loss_pct is not None else "loss=?"
+        return f"{ip.ip:<18}  {score:<10}  {tls}  {rtt:<10}  {loss}"
+
+    if approved:
+        lines.append(f"{'─'*20} ОДОБРЕННЫЕ ({len(approved)}) {'─'*20}")
+        lines.extend(_fmt(ip) for ip in approved)
+        lines.append("")
+
+    if pending:
+        lines.append(f"{'─'*20} ОЖИДАЮТ ПРОВЕРКИ ({len(pending)}) {'─'*20}")
+        lines.extend(ip.ip for ip in pending)
+        lines.append("")
+
+    if rejected:
+        lines.append(f"{'─'*20} ОТКЛОНЁННЫЕ ({len(rejected)}) {'─'*20}")
+        lines.extend(_fmt(ip) for ip in rejected)
+
+    content = "\n".join(lines).encode("utf-8")
+    filename = f"pool_{pool_id}_{pool.host_tag}.txt"
+    await call.message.answer_document(
+        BufferedInputFile(content, filename=filename),
+        caption=f"📋 <b>{pool.name}</b> — {len(approved)}/{len(all_ips)} одобрено",
+        parse_mode="HTML",
     )
 
 
