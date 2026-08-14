@@ -308,7 +308,8 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
             pool_svc = ManagedPoolService(session)
             for ip in batch:
                 tls_ok, tls_ms = tls_batch.get(ip, (None, None))
-                ping_ok, ping_rtt, ping_loss = ping_batch.get(ip, (None, None, None))
+                # distributed_ping_check returns (reachable, loss_pct, avg_rtt_ms)
+                ping_ok, ping_loss, ping_rtt = ping_batch.get(ip, (None, None, None))
 
                 # Count ping result
                 if ping_ok is True:   b_ping_ok += 1

@@ -183,8 +183,8 @@ async def mpool_ips(
     def _fmt(ip) -> str:
         score = f"score={ip.score:.0f}" if ip.score is not None else "score=—"
         tls   = "TLS=✓" if ip.tls_ok else ("TLS=✗" if ip.tls_ok is False else "TLS=?")
-        rtt   = f"RTT={ip.ping_rtt_ms:.0f}ms" if ip.ping_rtt_ms is not None else "RTT=?"
-        loss  = f"loss={ip.ping_loss_pct * 100:.0f}%" if ip.ping_loss_pct is not None else "loss=?"
+        rtt   = f"RTT={ip.ping_rtt_ms:.1f}ms" if ip.ping_rtt_ms is not None else "RTT=?"
+        loss  = f"loss={ip.ping_loss_pct * 100:.1f}%" if ip.ping_loss_pct is not None else "loss=?"
         return f"{ip.ip:<18}  {score:<10}  {tls}  {rtt:<10}  {loss}"
 
     if approved:
@@ -201,7 +201,7 @@ async def mpool_ips(
         lines.append(f"{'─'*20} ОТКЛОНЁННЫЕ ({len(rejected)}) {'─'*20}")
         lines.extend(_fmt(ip) for ip in rejected)
 
-    content = "\n".join(lines).encode("utf-8")
+    content = "\n".join(lines).encode("utf-8-sig")  # BOM → Windows opens correctly
     filename = f"pool_{pool_id}_{pool.host_tag}.txt"
     await call.message.answer_document(
         BufferedInputFile(content, filename=filename),
