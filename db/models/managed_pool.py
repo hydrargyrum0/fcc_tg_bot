@@ -21,6 +21,8 @@ class ManagedPool(Base):
     ip_set_ids: Mapped[list] = mapped_column(JSON, nullable=False)
     score_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=60.0)
     check_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=120)
+    # short UUID of the service Remnawave user whose subscription is used for VLESS tests
+    vless_service_short_uuid: Mapped[str | None] = mapped_column(String(50), nullable=True)
     last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

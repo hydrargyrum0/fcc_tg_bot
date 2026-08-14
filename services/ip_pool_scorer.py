@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL = 60          # seconds between "which pools are due?" wakeups
 TLS_TARGET = "kremnezar.online"
 TLS_PORT = 443
-SERVICE_TG_ID = 9636        # service user for VLESS config template
 
 _scoring_pools: set[int] = set()   # pool IDs currently being scored (in-flight guard)
 
@@ -354,19 +353,21 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
 
     # ── 4. Get VLESS config template ──────────────────────────────────────────
     vless_template: dict | None = None
-    try:
-        vless_template = await get_vless_config_for_tag(
-            panel.url, panel.api_token, SERVICE_TG_ID, pool.host_tag,
+    if not pool.vless_service_short_uuid:
+        logger.info(
+            "Pool %d: no vless_service_short_uuid configured — skipping VLESS checks", pool_id
         )
-        if vless_template:
-            logger.debug("Pool %d: VLESS config template loaded for tag '%s'", pool_id, pool.host_tag)
-        else:
-            logger.warning(
-                "Pool %d: no VLESS config found for tag '%s' (service user %d not found or tag has no hosts)",
-                pool_id, pool.host_tag, SERVICE_TG_ID,
+    else:
+        try:
+            vless_template = await get_vless_config_for_tag(
+                panel.url, panel.api_token, pool.vless_service_short_uuid, pool.host_tag,
             )
-    except RemnaWaveAPIError as e:
-        logger.warning("Pool %d: could not get VLESS config: %s", pool_id, e)
+            if vless_template:
+                logger.debug(
+                    "Pool %d: VLESS config template loaded for tag '%s'", pool_id, pool.host_tag
+                )
+        except RemnaWaveAPIError as e:
+            logger.warning("Pool %d: could not get VLESS config: %s", pool_id, e)
 
     # ── 5. Fetch IPs that need checking ──────────────────────────────────────
     async with session_factory() as session:

@@ -8,4 +8,5 @@ class ManagedPoolFSM(StatesGroup):
     choosing_tag = State()
     choosing_threshold = State()
     choosing_interval = State()
+    choosing_vless_uuid = State()   # short UUID of VLESS service user
     confirming = State()

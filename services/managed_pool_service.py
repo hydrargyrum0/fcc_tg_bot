@@ -52,6 +52,7 @@ class ManagedPoolService:
         ip_set_ids: list[int],
         score_threshold: float = 60.0,
         check_interval_minutes: int = 120,
+        vless_service_short_uuid: str | None = None,
     ) -> ManagedPool:
         pool = ManagedPool(
             org_id=org_id,
@@ -60,6 +61,7 @@ class ManagedPoolService:
             ip_set_ids=ip_set_ids,
             score_threshold=score_threshold,
             check_interval_minutes=check_interval_minutes,
+            vless_service_short_uuid=vless_service_short_uuid,
         )
         self._s.add(pool)
         await self._s.commit()
