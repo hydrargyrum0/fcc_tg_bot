@@ -350,6 +350,7 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
             logger.info("Pool %d: removed %d stale IPs", pool_id, removed)
         for ip in unique_ips:
             await pool_svc.upsert_ip(pool_id, ip)
+        await session.commit()  # flush() inside upsert_ip is not enough — must commit
 
     # ── 4. Get VLESS config template ──────────────────────────────────────────
     vless_template: dict | None = None
