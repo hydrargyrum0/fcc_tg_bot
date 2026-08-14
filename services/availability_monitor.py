@@ -227,17 +227,25 @@ async def _do_process_group(
         return
 
     logger.info("Group %d: checking current IPs: %s", group_id, unique_current_ips)
-    try:
-        ip_results = await distributed_ping_check(pc.api_url, pc.api_key, unique_current_ips)
-    except PingachockAPIError as e:
-        logger.error("Group %d: Pingachock check failed: %s", group_id, e)
-        return
+    ip_results: dict[str, tuple[bool | None, float | None, float | None]] = {}
+    for _i in range(0, len(unique_current_ips), CHECK_BATCH):
+        _batch = unique_current_ips[_i: _i + CHECK_BATCH]
+        try:
+            batch_res = await distributed_ping_check(pc.api_url, pc.api_key, _batch)
+            ip_results.update(batch_res)
+        except PingachockAPIError as e:
+            logger.error("Group %d: Pingachock check failed: %s", group_id, e)
+            # Mark unknown — not dead; will be re-checked next cycle
+            for _ip in _batch:
+                ip_results[_ip] = (None, None, None)
 
-    # Classify each IP: dead / lossy / ok
+    # Classify each IP: dead / lossy / ok / unknown
     # ip → (loss_pct | None, avg_rtt_ms | None)
     dead_ips: dict[str, tuple[float | None, float | None]] = {}
     lossy_ips: dict[str, tuple[float | None, float | None]] = {}
     for ip, (reachable, loss_pct, avg_rtt_ms) in ip_results.items():
+        if reachable is None:
+            continue  # check timed out — unknown; do not classify as dead or lossy
         if not reachable:
             dead_ips[ip] = (loss_pct, avg_rtt_ms)
         elif loss_pct is not None and loss_pct > LOSS_THRESHOLD:
@@ -245,7 +253,9 @@ async def _do_process_group(
 
     log_parts: dict[str, str] = {}
     for ip, (reachable, loss_pct, avg_rtt_ms) in ip_results.items():
-        if not reachable:
+        if reachable is None:
+            status = "UNKNOWN"
+        elif not reachable:
             status = "DEAD"
         elif loss_pct is not None and loss_pct > LOSS_THRESHOLD:
             status = "LOSSY"
@@ -620,8 +630,8 @@ async def _find_replacement_from_pool(
             logger.warning("Pool %d: final ping batch failed: %s", pool_id, e)
             continue
         for candidate in batch:
-            reachable, _, _ = ping_results.get(candidate.ip, (False, None, None))
-            if reachable:
+            reachable, _, _ = ping_results.get(candidate.ip, (None, None, None))
+            if reachable is True:  # confirmed; None (timeout) = skip, need verified IPs
                 logger.info(
                     "Pool %d: replacement %s selected (score=%.0f, speed=%s Mbps)",
                     pool_id, candidate.ip, candidate.score,
@@ -827,8 +837,8 @@ async def _find_replacement(
             logger.warning("Group %d: ping error during replacement search: %s", group_id, e)
             continue
         for ip in batch:
-            reachable, loss_pct, avg_rtt_ms = results.get(ip, (False, None, None))
-            if not reachable:
+            reachable, loss_pct, avg_rtt_ms = results.get(ip, (None, None, None))
+            if reachable is not True:  # False = dead, None = timeout; only use confirmed IPs
                 continue
             # If loss data is available and exceeds threshold — skip (when require_low_loss).
             # If loss data is absent (None) — accept: no evidence of lossy behaviour.

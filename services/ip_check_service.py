@@ -15,7 +15,9 @@ from services.pingachock_api_service import (
     list_checks,
 )
 
-CHECK_BATCH = 5  # IPs per Pingachock distributed-check batch
+CHECK_BATCH = 5      # IPs per Pingachock distributed-check batch
+POLL_TIMEOUT = 900.0  # 15 min — background tasks have no external deadline
+POLL_INTERVAL = 5.0   # seconds between Pingachock status polls
 
 # Matches bare IPv4, IPv4/CIDR, bare IPv6, IPv6/CIDR embedded in any text
 _IP_PATTERN = _re.compile(
@@ -93,19 +95,59 @@ def expand_addresses(addresses_text: str, cap: int | None = None) -> tuple[list[
     return ips, truncated
 
 
+async def poll_batch(
+    api_url: str,
+    api_key: str,
+    batch_id: str | None,
+    check_ids: set[str],
+    poll_timeout: float = POLL_TIMEOUT,
+    poll_interval: float = POLL_INTERVAL,
+) -> dict[str, str]:
+    """Poll Pingachock until all check IDs reach a terminal state or timeout.
+
+    Returns {check_id: status}:
+    - "completed" / "partial" / "failed" / "cancelled" — finished checks
+    - "pending" / "running" (last seen) — checks still in-progress at timeout
+
+    Callers must treat non-terminal statuses as **unknown**, never as "failed".
+    """
+    pending = set(check_ids)
+    statuses: dict[str, str] = {cid: "pending" for cid in check_ids}
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + poll_timeout
+    while pending and loop.time() < deadline:
+        await asyncio.sleep(poll_interval)
+        try:
+            checks = await list_checks(api_url, api_key, batch_id=batch_id, limit=200)
+        except PingachockAPIError:
+            continue
+        for c in checks:
+            cid = c["id"]
+            if cid not in pending:
+                continue
+            status = c.get("status", "")
+            statuses[cid] = status
+            if status in ("completed", "partial", "failed", "cancelled"):
+                pending.discard(cid)
+    return statuses
+
+
 async def distributed_check(
     api_url: str,
     api_key: str,
     ips: list[str],
     *,
-    poll_timeout: float = 90.0,
-    poll_interval: float = 3.0,
-) -> dict[str, bool]:
+    poll_timeout: float = POLL_TIMEOUT,
+    poll_interval: float = POLL_INTERVAL,
+) -> dict[str, bool | None]:
     """Check IPs via real TM Pingachock nodes (ICMP ping + TCP 443).
 
-    Fires two batch checks concurrently (ping and tcp), then polls until
-    all complete or timeout. Returns {ip: True} if at least one TM node
-    could reach the IP via either ICMP or TCP:443.
+    Fires two batch checks concurrently (ping and tcp), then polls until all
+    complete or timeout.  Returns:
+      True  — at least one node reached the IP via ping or TCP:443
+      False — all checks finished and none succeeded
+      None  — at least one check timed out (unknown — do NOT treat as failed)
     """
     if not ips:
         return {}
@@ -138,7 +180,10 @@ async def distributed_check(
             id_to_ip[c["id"]] = c["target"]
             pending_ids.add(c["id"])
 
-    ip_ok: dict[str, bool] = {ip: False for ip in ips}
+    # None = unknown (check still pending at timeout)
+    # False = tentative (may be upgraded to True by the other check type)
+    # True  = confirmed reachable
+    ip_ok: dict[str, bool | None] = {ip: None for ip in ips}
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + poll_timeout
@@ -159,11 +204,15 @@ async def distributed_check(
                 status = c.get("status", "")
                 if status in ("completed", "partial", "failed", "cancelled"):
                     pending_ids.discard(cid)
+                    ip = id_to_ip.get(cid)
+                    if not ip:
+                        continue
                     if status in ("completed", "partial"):
-                        ip = id_to_ip.get(cid)
-                        if ip:
-                            ip_ok[ip] = True
+                        ip_ok[ip] = True          # any success wins
+                    elif ip_ok[ip] is None:
+                        ip_ok[ip] = False         # tentative; other check may override
 
+    # IPs still in pending_ids hit the timeout → remain None (unknown)
     return ip_ok
 
 
@@ -173,13 +222,13 @@ async def distributed_ping_check(
     ips: list[str],
     *,
     count: int = 4,
-    poll_timeout: float = 90.0,
-    poll_interval: float = 3.0,
-) -> dict[str, tuple[bool, float | None, float | None]]:
+    poll_timeout: float = POLL_TIMEOUT,
+    poll_interval: float = POLL_INTERVAL,
+) -> dict[str, tuple[bool | None, float | None, float | None]]:
     """ICMP-only ping, single distributed check.
 
     Returns {ip: (reachable, loss_pct, avg_rtt_ms)} where:
-      reachable  — True if check status is completed / partial
+      reachable  — True/False if check completed; None if check timed out (unknown)
       loss_pct   — fraction 0.0–1.0 of packets lost; None if no node reported
                    raw packet data (treat unknown as acceptable, not penalise)
       avg_rtt_ms — average RTT in milliseconds; None if unavailable
@@ -198,24 +247,10 @@ async def distributed_ping_check(
         id_to_ip[c["id"]] = c["target"]
 
     if not id_to_ip:
-        return {ip: (False, None, None) for ip in ips}
+        return {ip: (None, None, None) for ip in ips}
 
     batch_id = resp.get("batch_id")
-    pending_ids: set[str] = set(id_to_ip.keys())
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + poll_timeout
-    while pending_ids and loop.time() < deadline:
-        await asyncio.sleep(poll_interval)
-        try:
-            checks = await list_checks(api_url, api_key, batch_id=batch_id, limit=200)
-        except PingachockAPIError:
-            continue
-        for c in checks:
-            if c["id"] in pending_ids and c.get("status") in (
-                "completed", "partial", "failed", "cancelled"
-            ):
-                pending_ids.discard(c["id"])
+    await poll_batch(api_url, api_key, batch_id, set(id_to_ip.keys()), poll_timeout, poll_interval)
 
     # Fetch all check results in parallel — one HTTP request per check ID.
     check_ids = list(id_to_ip.keys())
@@ -224,7 +259,7 @@ async def distributed_ping_check(
         return_exceptions=True,
     )
 
-    results: dict[str, tuple[bool, float | None, float | None]] = {}
+    results: dict[str, tuple[bool | None, float | None, float | None]] = {}
     for check_id, fetch_result in zip(check_ids, raw_fetches):
         ip = id_to_ip[check_id]
         if isinstance(fetch_result, Exception):
@@ -232,7 +267,12 @@ async def distributed_ping_check(
             continue
 
         check_data: dict = fetch_result
-        reachable = check_data.get("status") in ("completed", "partial")
+        status = check_data.get("status")
+        if status not in ("completed", "partial", "failed", "cancelled"):
+            # Check timed out — we genuinely don't know; do NOT treat as failure
+            results[ip] = (None, None, None)
+            continue
+        reachable = status in ("completed", "partial")
         total_sent = 0
         total_recv = 0
         total_rtt_sum = 0.0

@@ -18,10 +18,13 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from db.models.managed_pool import ManagedIp, ManagedPool
-from services.ip_check_service import CHECK_BATCH, distributed_ping_check, normalize_addresses
+from services.ip_check_service import (
+    CHECK_BATCH, POLL_INTERVAL, POLL_TIMEOUT,
+    distributed_ping_check, normalize_addresses, poll_batch,
+)
 from services.ip_set_service import IpSetService
 from services.managed_pool_service import ManagedPoolService
-from services.pingachock_api_service import PingachockAPIError, create_check, get_check, list_checks
+from services.pingachock_api_service import PingachockAPIError, create_check, get_check
 from services.pingachock_service import PingachockService
 from services.remnawave_api_service import RemnaWaveAPIError, get_vless_config_for_tag
 from services.remnawave_service import RemnaWaveService
@@ -115,13 +118,14 @@ async def _tls_check_batch(
     api_url: str,
     api_key: str,
     ips: list[str],
-    poll_timeout: float = 90.0,
-    poll_interval: float = 3.0,
-) -> dict[str, tuple[bool, float | None]]:
+    poll_timeout: float = POLL_TIMEOUT,
+    poll_interval: float = POLL_INTERVAL,
+) -> dict[str, tuple[bool | None, float | None]]:
     """TLS handshake check against TLS_TARGET:TLS_PORT for each IP.
 
     Pingachock TLS check uses the IP as the connection target and SNI for
-    the domain name.  Returns {ip: (ok, handshake_ms_or_None)}.
+    the domain name.  Returns {ip: (ok, handshake_ms_or_None)} where ok is
+    None if the check timed out (unknown — do NOT treat as failed).
     """
     if not ips:
         return {}
@@ -133,38 +137,29 @@ async def _tls_check_batch(
         )
     except PingachockAPIError as e:
         logger.warning("TLS batch check failed: %s", e)
-        return {ip: (False, None) for ip in ips}
+        return {ip: (None, None) for ip in ips}
 
     id_to_ip: dict[str, str] = {c["id"]: c["target"] for c in resp.get("checks", [])}
     batch_id = resp.get("batch_id")
-    pending = set(id_to_ip.keys())
 
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + poll_timeout
-    while pending and loop.time() < deadline:
-        await asyncio.sleep(poll_interval)
-        try:
-            checks = await list_checks(api_url, api_key, batch_id=batch_id, limit=200)
-        except PingachockAPIError:
-            continue
-        for c in checks:
-            if c["id"] in pending and c.get("status") in (
-                "completed", "partial", "failed", "cancelled"
-            ):
-                pending.discard(c["id"])
+    await poll_batch(api_url, api_key, batch_id, set(id_to_ip.keys()), poll_timeout, poll_interval)
 
     fetches = await asyncio.gather(
         *[get_check(api_url, api_key, cid, expand="runs") for cid in id_to_ip],
         return_exceptions=True,
     )
 
-    results: dict[str, tuple[bool, float | None]] = {}
+    results: dict[str, tuple[bool | None, float | None]] = {}
     for cid, fetch in zip(id_to_ip.keys(), fetches):
         ip = id_to_ip[cid]
         if isinstance(fetch, Exception):
             results[ip] = (False, None)
             continue
-        ok = fetch.get("status") in ("completed", "partial")
+        status = fetch.get("status")
+        if status not in ("completed", "partial", "failed", "cancelled"):
+            results[ip] = (None, None)   # timed out — unknown, not failed
+            continue
+        ok = status in ("completed", "partial")
         rtt: float | None = None
         for run in fetch.get("runs", []):
             r = run.get("result") or {}
@@ -188,9 +183,9 @@ async def _vless_check_ip(
     api_key: str,
     ip: str,
     vless_template: dict,
-    poll_timeout: float = 120.0,
-    poll_interval: float = 5.0,
-) -> tuple[bool, float | None]:
+    poll_timeout: float = POLL_TIMEOUT,
+    poll_interval: float = POLL_INTERVAL,
+) -> tuple[bool | None, float | None]:
     """VLESS speedtest for a single IP.
 
     Substitutes test IP into the template outbound and submits to Pingachock.
@@ -221,29 +216,17 @@ async def _vless_check_ip(
         return False, None
 
     batch_id = resp.get("batch_id")
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + poll_timeout
-    while loop.time() < deadline:
-        await asyncio.sleep(poll_interval)
-        try:
-            checks = await list_checks(api_url, api_key, batch_id=batch_id, limit=50)
-        except PingachockAPIError:
-            continue
-        for c in checks:
-            if c["id"] == check_id and c.get("status") in (
-                "completed", "partial", "failed", "cancelled"
-            ):
-                break
-        else:
-            continue
-        break
+    await poll_batch(api_url, api_key, batch_id, {check_id}, poll_timeout, poll_interval)
 
     try:
         check_data = await get_check(api_url, api_key, check_id, expand="runs")
     except PingachockAPIError:
         return False, None
 
-    ok = check_data.get("status") in ("completed", "partial")
+    status = check_data.get("status")
+    if status not in ("completed", "partial", "failed", "cancelled"):
+        return None, None   # timed out — unknown, not failed
+    ok = status in ("completed", "partial")
     speed: float | None = None
     for run in check_data.get("runs", []):
         raw = (run.get("result") or {}).get("raw") or {}
@@ -424,7 +407,7 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
     # ── 8. VLESS check (sequential, only reachable IPs) ──────────────────────
     vless_results: dict[str, tuple[bool, float | None]] = {}
     if vless_template:
-        reachable = [ip for ip in check_ips if ping_results.get(ip, (False,))[0]]
+        reachable = [ip for ip in check_ips if ping_results.get(ip, (None,))[0] is True]
         for ip in reachable:
             vless_ok, speed = await _vless_check_ip(pc.api_url, pc.api_key, ip, vless_template)
             vless_results[ip] = (vless_ok, speed)
@@ -442,7 +425,14 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
         from sqlalchemy import select as _select
         for managed_ip in to_check:
             ip = managed_ip.ip
-            ping_ok, ping_rtt, ping_loss = ping_results.get(ip, (False, None, None))
+            ping_ok, ping_rtt, ping_loss = ping_results.get(ip, (None, None, None))
+
+            if ping_ok is None:
+                # Ping check timed out — we don't know the state.
+                # Preserve existing score/approved; re-check next cycle.
+                logger.debug("Pool %d: skip %s — ping timed out, preserving score", pool_id, ip)
+                continue
+
             tls_ok, tls_ms = tls_results.get(ip, (None, None))
             vless_ok, vless_speed = vless_results.get(ip, (None, None))
 
