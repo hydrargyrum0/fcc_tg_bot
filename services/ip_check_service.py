@@ -335,7 +335,15 @@ async def tls_check_batch(
             results[ip] = (None, None)   # only "server" responded — unknown
             continue
 
-        done_runs = [r for r in work_runs if r.get("status") == "done"]
+        _ACTIVE_RUN_STATUSES = frozenset({"pending", "running", "queued"})
+        done_runs = [r for r in work_runs if r.get("status") not in _ACTIVE_RUN_STATUSES]
+
+        logger.debug(
+            "TLS %s: work_runs: %s",
+            ip,
+            [(run_node_name(r), r.get("status")) for r in work_runs],
+        )
+
         rtt: float | None = None
         for run in done_runs:
             r = run.get("result") or {}
@@ -423,15 +431,44 @@ async def distributed_ping_check(
         work_runs = [r for r in all_runs if run_node_name(r) not in EXCLUDED_NODES]
         if not work_runs:
             # No distributed-node runs (all excluded) — result is unknown
+            logger.debug(
+                "IP %s: check %s completed but all runs are from excluded nodes %s "
+                "(nodes: %s)",
+                ip, check_id, EXCLUDED_NODES,
+                [(run_node_name(r), r.get("status")) for r in all_runs],
+            )
             results[ip] = (None, None, None)
             continue
 
-        # Derive reachability from done runs only
-        done_runs = [r for r in work_runs if r.get("status") == "done"]
+        # Derive reachability from finished runs.
+        # Accept any terminal state — Pingachock uses "done" for successful runs
+        # but may use "failed", "error", "timeout", etc. for unreachable nodes.
+        # Explicitly skip only actively-running states.
+        _ACTIVE_RUN_STATUSES = frozenset({"pending", "running", "queued"})
+        done_runs = [r for r in work_runs if r.get("status") not in _ACTIVE_RUN_STATUSES]
+
+        logger.debug(
+            "IP %s: check %s — work_runs: %s",
+            ip, check_id,
+            [(run_node_name(r), r.get("status")) for r in work_runs],
+        )
+
         if done_runs:
             reachable: bool | None = any(_ping_run_ok(r) for r in done_runs)
         else:
-            reachable = None   # distributed nodes didn't complete
+            # work_runs exist (TM nodes were assigned) but none reached terminal
+            # state even after the check was marked "completed".  This happens
+            # when the check completes because the "server" node finished quickly
+            # while TM nodes are still awaiting ICMP responses from a blocked IP.
+            # Treat as unreachable rather than unknown — a stuck TM run means the
+            # IP is effectively unreachable from distributed nodes.
+            logger.info(
+                "IP %s: check %s — all work_runs still active after check completed "
+                "(nodes: %s); treating as DEAD",
+                ip, check_id,
+                [(run_node_name(r), r.get("status")) for r in work_runs],
+            )
+            reachable = False
 
         total_sent = 0
         total_recv = 0
@@ -439,7 +476,7 @@ async def distributed_ping_check(
         rtt_count = 0
 
         for run in work_runs:
-            if run.get("status") != "done":
+            if run.get("status") in _ACTIVE_RUN_STATUSES:
                 continue
             result = run.get("result") or {}
             raw = result.get("raw") or {}
