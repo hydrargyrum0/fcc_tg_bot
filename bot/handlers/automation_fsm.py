@@ -43,7 +43,7 @@ from db.models.organization import Organization
 from db.models.user import User
 from services.audit_service import send_audit
 from services.automation_service import AutomationService
-from services.availability_monitor import _processing_groups, request_skip
+from services.availability_monitor import _processing_groups, request_skip, run_group_check_now
 from services.ip_set_service import IpSetService
 from services.managed_pool_service import ManagedPoolService
 from services.remnawave_api_service import RemnaWaveAPIError, get_hosts
@@ -542,7 +542,7 @@ async def avail_confirm_create(
         return
 
     auto_svc = AutomationService(session)
-    await auto_svc.add_group(
+    group = await auto_svc.add_group(
         org_id=active_org.id,
         panel_id=panel_id,
         host_tag=selected_tag,
@@ -552,7 +552,14 @@ async def avail_confirm_create(
         managed_pool_id=managed_pool_id,
     )
     await state.clear()
-    await call.answer("✅ Группа создана!", show_alert=False)
+
+    # Fire initial check immediately — don't wait for the scheduled interval
+    await run_group_check_now(call.bot, group.id)
+
+    await call.answer(
+        "✅ Группа создана! Запускаю первичную проверку хостов...",
+        show_alert=False,
+    )
     send_audit(
         call.bot, active_org.id, db_user,
         f"Создал группу автоматизации: тег «{selected_tag}», "

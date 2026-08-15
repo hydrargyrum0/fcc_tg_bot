@@ -29,6 +29,7 @@ from bot.middlewares.redis import RedisMiddleware
 from bot.middlewares.role import RoleMiddleware
 from config import settings
 from db.session import async_session_factory
+import services.availability_monitor as _avail_monitor
 from services.availability_monitor import run_availability_monitor
 from services.ip_pool_scorer import run_ip_pool_scorer
 from services.monitoring_service import run_monitoring
@@ -63,6 +64,10 @@ async def main() -> None:
     dp.include_router(common.router)
     dp.include_router(superadmin.router)
     dp.include_router(member.router)
+
+    # Initialise availability monitor with DB session factory so it can
+    # fire on-demand checks (e.g. immediately after group creation).
+    _avail_monitor.init(async_session_factory)
 
     monitoring_task = asyncio.create_task(run_monitoring(bot, redis))
     availability_task = asyncio.create_task(

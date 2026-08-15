@@ -19,7 +19,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from db.models.managed_pool import ManagedIp, ManagedPool
 from services.ip_check_service import (
     CHECK_BATCH, EXCLUDED_NODES, POLL_INTERVAL as _CHECK_POLL_INTERVAL, POLL_TIMEOUT,
+    TLS_CHECK_HOST, TLS_CHECK_PORT,
     distributed_ping_check, normalize_addresses, poll_batch, run_node_name,
+    tls_check_batch, wait_for_automation_priority,
 )
 from services.ip_set_service import IpSetService
 from services.managed_pool_service import ManagedPoolService
@@ -29,9 +31,8 @@ from services.pingachock_service import PingachockService
 logger = logging.getLogger(__name__)
 
 SCORER_WAKEUP_INTERVAL = 60  # seconds between "which pools are due?" wakeups
-TLS_TARGET = "kremnezar.online"
-TLS_PORT = 443
 POOL_SCORE_BATCH = 50        # IPs per Pingachock batch for pool scoring (vs CHECK_BATCH=5 for monitor)
+# TLS constants live in ip_check_service: TLS_CHECK_HOST / TLS_CHECK_PORT
 
 _scoring_pools: set[int] = set()        # pool IDs currently being full-scored
 _health_checking_pools: set[int] = set()  # pool IDs currently being health-checked
@@ -70,88 +71,6 @@ def compute_score(
         elif ping_rtt_ms < 300:
             rtt_bonus = 5.0
     return min(100.0, 70.0 - loss_penalty + rtt_bonus)
-
-
-# ── TLS batch check ───────────────────────────────────────────────────────────
-
-async def _tls_check_batch(
-    api_url: str,
-    api_key: str,
-    ips: list[str],
-    poll_timeout: float = POLL_TIMEOUT,
-    poll_interval: float = _CHECK_POLL_INTERVAL,  # 5 s — same cadence as ping poller
-) -> dict[str, tuple[bool | None, float | None]]:
-    """TLS handshake check against TLS_TARGET:TLS_PORT for each IP.
-
-    Pingachock TLS check uses the IP as the connection target and SNI for
-    the domain name.  Returns {ip: (ok, handshake_ms_or_None)} where ok is
-    None if the check timed out (unknown — do NOT treat as failed).
-    """
-    if not ips:
-        return {}
-    try:
-        resp = await create_check(
-            api_url, api_key, "tls", {"all": True},
-            targets=ips,
-            params={"port": TLS_PORT, "sni": TLS_TARGET, "count": 2, "allow_insecure": True},
-        )
-    except PingachockAPIError as e:
-        logger.warning("TLS batch check failed: %s", e)
-        return {ip: (None, None) for ip in ips}
-
-    id_to_ip: dict[str, str] = {c["id"]: c["target"] for c in resp.get("checks", [])}
-    batch_id = resp.get("batch_id")
-
-    await poll_batch(api_url, api_key, batch_id, set(id_to_ip.keys()), poll_timeout, poll_interval)
-
-    fetches = await asyncio.gather(
-        *[get_check(api_url, api_key, cid, expand="runs") for cid in id_to_ip],
-        return_exceptions=True,
-    )
-
-    results: dict[str, tuple[bool | None, float | None]] = {}
-    for cid, fetch in zip(id_to_ip.keys(), fetches):
-        ip = id_to_ip[cid]
-        if isinstance(fetch, Exception):
-            results[ip] = (False, None)
-            continue
-        status = fetch.get("status")
-        if status not in ("completed", "partial", "failed", "cancelled"):
-            results[ip] = (None, None)   # timed out — unknown, not failed
-            continue
-
-        # Exclude "server" node — see EXCLUDED_NODES in ip_check_service
-        all_runs = fetch.get("runs", [])
-        work_runs = [r for r in all_runs if run_node_name(r) not in EXCLUDED_NODES]
-        if not work_runs:
-            # Only the backend "server" node responded — treat as unknown
-            results[ip] = (None, None)
-            continue
-
-        # TLS ok: at least one included done run has a positive handshake RTT
-        done_runs = [r for r in work_runs if r.get("status") == "done"]
-        rtt: float | None = None
-        for run in done_runs:
-            r = run.get("result") or {}
-            for key in ("latency_ms", "handshake_ms", "duration_ms", "rtt_ms"):
-                v = r.get(key)
-                if v is not None:
-                    try:
-                        rtt = float(v)
-                    except (ValueError, TypeError):
-                        pass
-                    break
-            if rtt is not None:
-                break
-
-        ok: bool | None
-        if done_runs:
-            ok = rtt is not None and rtt > 0
-        else:
-            ok = None   # no included runs completed
-
-        results[ip] = (ok, rtt)
-    return results
 
 
 # ── main pool scoring loop ────────────────────────────────────────────────────
@@ -282,7 +201,7 @@ async def _health_check_pool(session_factory: async_sessionmaker, pool_id: int) 
 
         ping_res_or_exc, tls_res_or_exc = await asyncio.gather(
             distributed_ping_check(pc.api_url, pc.api_key, batch),
-            _tls_check_batch(pc.api_url, pc.api_key, batch),
+            tls_check_batch(pc.api_url, pc.api_key, batch),
             return_exceptions=True,
         )
         ping_batch: dict[str, tuple[bool | None, float | None, float | None]] = (
@@ -342,6 +261,7 @@ async def _health_check_pool(session_factory: async_sessionmaker, pool_id: int) 
             pool_id, batch_num, total_batches,
             time.monotonic() - batch_t0, b_kept, b_revoked, b_skipped,
         )
+        await wait_for_automation_priority()
 
     elapsed = time.monotonic() - t0
     m, s = divmod(int(elapsed), 60)
@@ -436,7 +356,7 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
         # Ping + TLS in parallel — independent, no need to wait for each other
         ping_res_or_exc, tls_res_or_exc = await asyncio.gather(
             distributed_ping_check(pc.api_url, pc.api_key, batch),
-            _tls_check_batch(pc.api_url, pc.api_key, batch),
+            tls_check_batch(pc.api_url, pc.api_key, batch),
             return_exceptions=True,
         )
 
@@ -535,6 +455,8 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
             b_tls_ok, b_tls_fail, b_tls_timeout,
             b_approved, len(batch) - b_skipped,
         )
+        # Yield between batches so automation group checks can proceed
+        await wait_for_automation_priority()
 
     async with session_factory() as session:
         await ManagedPoolService(session).mark_scanned(pool_id)

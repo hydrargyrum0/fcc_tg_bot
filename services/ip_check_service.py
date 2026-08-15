@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import re as _re
 
 from services.pingachock_api_service import (
@@ -15,9 +16,33 @@ from services.pingachock_api_service import (
     list_checks,
 )
 
+logger = logging.getLogger(__name__)
+
 CHECK_BATCH = 5      # IPs per Pingachock distributed-check batch
 POLL_TIMEOUT = 900.0  # 15 min — background tasks have no external deadline
 POLL_INTERVAL = 5.0   # seconds between Pingachock status polls
+
+# TLS check defaults — used by tls_check_batch() and pool scorer
+TLS_CHECK_HOST = "kremnezar.online"
+TLS_CHECK_PORT = 443
+
+# ── automation priority ───────────────────────────────────────────────────────
+
+_automation_active: set[int] = set()   # group IDs with checks currently in-flight
+
+
+async def wait_for_automation_priority() -> None:
+    """Pool scoring and health checks call this between batches.
+
+    If automation group checks are in-flight, yields the event loop so they
+    get to run without competing for Pingachock API quota with a large batch.
+    """
+    if _automation_active:
+        logger.debug(
+            "Pool scoring yielding — %d automation check(s) active: %s",
+            len(_automation_active), _automation_active,
+        )
+        await asyncio.sleep(0)
 
 # Matches bare IPv4, IPv4/CIDR, bare IPv6, IPv6/CIDR embedded in any text
 _IP_PATTERN = _re.compile(
@@ -252,6 +277,86 @@ def _ping_run_ok(run: dict) -> bool:
             except (ValueError, TypeError):
                 pass
     return False
+
+
+async def tls_check_batch(
+    api_url: str,
+    api_key: str,
+    ips: list[str],
+    tls_host: str = TLS_CHECK_HOST,
+    tls_port: int = TLS_CHECK_PORT,
+    poll_timeout: float = POLL_TIMEOUT,
+    poll_interval: float = POLL_INTERVAL,
+) -> dict[str, tuple[bool | None, float | None]]:
+    """TLS handshake check for each IP against tls_host:tls_port.
+
+    Returns {ip: (ok, handshake_ms_or_None)} where:
+      ok = True  — handshake completed (at least one distributed node)
+      ok = False — handshake confirmed failed on all included nodes
+      ok = None  — timed out or only excluded nodes responded (unknown)
+    """
+    if not ips:
+        return {}
+    try:
+        resp = await create_check(
+            api_url, api_key, "tls", {"all": True},
+            targets=ips,
+            params={"port": tls_port, "sni": tls_host, "count": 2, "allow_insecure": True},
+        )
+    except PingachockAPIError as e:
+        logger.warning("TLS batch check failed: %s", e)
+        return {ip: (None, None) for ip in ips}
+
+    id_to_ip: dict[str, str] = {c["id"]: c["target"] for c in resp.get("checks", [])}
+    batch_id = resp.get("batch_id")
+
+    await poll_batch(api_url, api_key, batch_id, set(id_to_ip.keys()), poll_timeout, poll_interval)
+
+    fetches = await asyncio.gather(
+        *[get_check(api_url, api_key, cid, expand="runs") for cid in id_to_ip],
+        return_exceptions=True,
+    )
+
+    results: dict[str, tuple[bool | None, float | None]] = {}
+    for cid, fetch in zip(id_to_ip.keys(), fetches):
+        ip = id_to_ip[cid]
+        if isinstance(fetch, Exception):
+            results[ip] = (False, None)
+            continue
+        status = fetch.get("status")
+        if status not in ("completed", "partial", "failed", "cancelled"):
+            results[ip] = (None, None)   # timed out — unknown, not failed
+            continue
+
+        # Exclude runs from the "server" backend node
+        all_runs = fetch.get("runs", [])
+        work_runs = [r for r in all_runs if run_node_name(r) not in EXCLUDED_NODES]
+        if not work_runs:
+            results[ip] = (None, None)   # only "server" responded — unknown
+            continue
+
+        done_runs = [r for r in work_runs if r.get("status") == "done"]
+        rtt: float | None = None
+        for run in done_runs:
+            r = run.get("result") or {}
+            for key in ("latency_ms", "handshake_ms", "duration_ms", "rtt_ms"):
+                v = r.get(key)
+                if v is not None:
+                    try:
+                        rtt = float(v)
+                    except (ValueError, TypeError):
+                        pass
+                    break
+            if rtt is not None:
+                break
+
+        if done_runs:
+            ok: bool | None = rtt is not None and rtt > 0
+        else:
+            ok = None   # no included runs completed
+
+        results[ip] = (ok, rtt)
+    return results
 
 
 async def distributed_ping_check(

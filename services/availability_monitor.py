@@ -41,7 +41,10 @@ from db.models.automation_group import AutomationGroup
 from db.models.managed_pool import ManagedIp
 from db.models.organization_member import OrganizationMember
 from services.automation_service import AutomationService
-from services.ip_check_service import CHECK_BATCH, distributed_ping_check, expand_addresses
+from services.ip_check_service import (
+    CHECK_BATCH, _automation_active,
+    distributed_ping_check, expand_addresses, tls_check_batch,
+)
 from services.ip_set_service import IpSetService
 from services.managed_pool_service import ManagedPoolService
 from services.pingachock_api_service import PingachockAPIError
@@ -50,6 +53,32 @@ from services.remnawave_api_service import RemnaWaveAPIError, get_hosts, update_
 from services.remnawave_service import RemnaWaveService
 
 logger = logging.getLogger(__name__)
+
+# ── module initialisation (called from main.py before tasks start) ────────────
+
+_session_factory: "async_sessionmaker | None" = None
+
+
+def init(session_factory: "async_sessionmaker") -> None:
+    """Store session_factory so run_group_check_now() can use it."""
+    global _session_factory
+    _session_factory = session_factory
+
+
+async def run_group_check_now(bot: "Bot", group_id: int) -> None:
+    """Fire an immediate check for a newly created automation group.
+
+    Safe to call from FSM handlers: creates a background asyncio task and
+    returns immediately.  No-ops silently if init() was not called yet.
+    """
+    if _session_factory is None:
+        logger.warning("run_group_check_now: session_factory not initialised (call init first)")
+        return
+    asyncio.create_task(
+        _process_group(bot, _session_factory, group_id),
+        name=f"avail-initial-{group_id}",
+    )
+
 
 # ── shared state (module-level, single event-loop safe) ───────────────────────
 
@@ -142,12 +171,14 @@ async def _process_group(
     group_id: int,
 ) -> None:
     _processing_groups.add(group_id)
+    _automation_active.add(group_id)   # signal pool scoring to yield
     try:
         await _do_process_group(bot, session_factory, group_id)
     except Exception:
         logger.exception("Availability monitor: error processing group %d", group_id)
     finally:
         _processing_groups.discard(group_id)
+        _automation_active.discard(group_id)
 
 
 async def _do_process_group(
@@ -220,50 +251,69 @@ async def _do_process_group(
         group_id, group.host_tag, len(tagged_hosts), len(pool), set_names,
     )
 
-    # ── check current IPs via Pingachock (single check) ─────────────────────
+    # ── check current IPs: ping + TLS in parallel ────────────────────────────
     # Strip port suffixes: Remnawave may store "1.2.3.4:443", Pingachock wants bare IPs.
     unique_current_ips = list({h.get("address", "").split(":")[0] for h in tagged_hosts if h.get("address")})
     if not unique_current_ips:
         return
 
     logger.info("Group %d: checking current IPs: %s", group_id, unique_current_ips)
-    ip_results: dict[str, tuple[bool | None, float | None, float | None]] = {}
-    for _i in range(0, len(unique_current_ips), CHECK_BATCH):
-        _batch = unique_current_ips[_i: _i + CHECK_BATCH]
-        try:
-            batch_res = await distributed_ping_check(pc.api_url, pc.api_key, _batch)
-            ip_results.update(batch_res)
-        except PingachockAPIError as e:
-            logger.error("Group %d: Pingachock check failed: %s", group_id, e)
-            # Mark unknown — not dead; will be re-checked next cycle
-            for _ip in _batch:
-                ip_results[_ip] = (None, None, None)
+
+    ping_res_or_exc, tls_res_or_exc = await asyncio.gather(
+        distributed_ping_check(pc.api_url, pc.api_key, unique_current_ips),
+        tls_check_batch(pc.api_url, pc.api_key, unique_current_ips),
+        return_exceptions=True,
+    )
+
+    if isinstance(ping_res_or_exc, Exception):
+        logger.error("Group %d: ping check failed: %s", group_id, ping_res_or_exc)
+        ip_results: dict[str, tuple[bool | None, float | None, float | None]] = {
+            ip: (None, None, None) for ip in unique_current_ips
+        }
+    else:
+        ip_results = ping_res_or_exc
+
+    if isinstance(tls_res_or_exc, Exception):
+        logger.error("Group %d: TLS check failed: %s", group_id, tls_res_or_exc)
+        tls_ip_results: dict[str, tuple[bool | None, float | None]] = {
+            ip: (None, None) for ip in unique_current_ips
+        }
+    else:
+        tls_ip_results = tls_res_or_exc
 
     # Classify each IP: dead / lossy / ok / unknown
-    # ip → (loss_pct | None, avg_rtt_ms | None)
+    #   dead  — ICMP unreachable OR TLS confirmed failed (False, not None)
+    #   lossy — ICMP ok, TLS ok/unknown, but packet loss > threshold
+    #   ok    — ICMP ok, TLS ok, loss within threshold
     dead_ips: dict[str, tuple[float | None, float | None]] = {}
     lossy_ips: dict[str, tuple[float | None, float | None]] = {}
-    for ip, (reachable, loss_pct, avg_rtt_ms) in ip_results.items():
-        if reachable is None:
-            continue  # check timed out — unknown; do not classify as dead or lossy
-        if not reachable:
-            dead_ips[ip] = (loss_pct, avg_rtt_ms)
-        elif loss_pct is not None and loss_pct > LOSS_THRESHOLD:
-            lossy_ips[ip] = (loss_pct, avg_rtt_ms)
-
     log_parts: dict[str, str] = {}
+
     for ip, (reachable, loss_pct, avg_rtt_ms) in ip_results.items():
+        tls_ok, tls_ms = tls_ip_results.get(ip, (None, None))
+
         if reachable is None:
-            status = "UNKNOWN"
+            verdict = "UNKNOWN"
         elif not reachable:
-            status = "DEAD"
+            verdict = "DEAD"
+            dead_ips[ip] = (loss_pct, avg_rtt_ms)
+        elif tls_ok is False:
+            verdict = "TLS_FAIL"
+            dead_ips[ip] = (loss_pct, avg_rtt_ms)  # treat TLS failure as dead
         elif loss_pct is not None and loss_pct > LOSS_THRESHOLD:
-            status = "LOSSY"
+            verdict = "LOSSY"
+            lossy_ips[ip] = (loss_pct, avg_rtt_ms)
         else:
-            status = "OK"
-        loss_str = f"loss={loss_pct*100:.0f}%" if loss_pct is not None else "loss=?"
+            verdict = "OK"
+
+        loss_str = f"loss={loss_pct * 100:.0f}%" if loss_pct is not None else "loss=?"
         rtt_str = f" rtt={avg_rtt_ms:.0f}ms" if avg_rtt_ms is not None else ""
-        log_parts[ip] = f"{status} {loss_str}{rtt_str}"
+        tls_str = (
+            f" tls={tls_ms:.0f}ms" if tls_ms is not None
+            else (" tls=FAIL" if tls_ok is False else " tls=?")
+        )
+        log_parts[ip] = f"{verdict} {loss_str}{rtt_str}{tls_str}"
+
     logger.info("Group %d: check results: %s", group_id, log_parts)
 
     if not dead_ips and not lossy_ips:
