@@ -194,7 +194,7 @@ async def _health_check_pool(session_factory: async_sessionmaker, pool_id: int) 
         pool_id, pool.name, len(ips), total_batches,
     )
 
-    node_selector = build_node_selector(pc)
+    node_selector = build_node_selector(pool)
     revoked = 0
     for batch_num, batch_start in enumerate(range(0, len(ips), POOL_SCORE_BATCH), 1):
         batch = ips[batch_start: batch_start + POOL_SCORE_BATCH]
@@ -349,7 +349,7 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
     from sqlalchemy import select as _select
     approved_count = 0
     skipped_count  = 0   # TLS timed out
-    node_selector = build_node_selector(pc)
+    node_selector = build_node_selector(pool)
 
     for batch_num, batch_start in enumerate(range(0, len(check_ips), POOL_SCORE_BATCH), 1):
         batch = check_ips[batch_start: batch_start + POOL_SCORE_BATCH]

@@ -9,3 +9,4 @@ class ManagedPoolFSM(StatesGroup):
     choosing_threshold = State()
     choosing_interval = State()
     confirming = State()
+    selecting_nodes = State()

@@ -25,6 +25,8 @@ class ManagedPool(Base):
     vless_service_short_uuid: Mapped[str | None] = mapped_column(String(50), nullable=True)
     last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Pingachock node UUIDs to use for checks; None = all nodes
+    node_ids: Mapped[list | None] = mapped_column(JSON, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

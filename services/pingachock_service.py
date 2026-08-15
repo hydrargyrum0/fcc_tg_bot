@@ -7,15 +7,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.models.pingachock_settings import PingachockSettings
 
 
-def build_node_selector(settings: PingachockSettings | None) -> dict:
+def build_node_selector(source=None) -> dict:
     """Return the Pingachock node_selector dict for API calls.
 
-    If the org has selected specific node UUIDs, returns
-    ``{"node_ids": [...]}``; otherwise returns ``{"all": True}``
-    which selects every non-virtual node registered in Pingachock.
+    Accepts any object with a ``node_ids`` attribute (e.g. ManagedPool),
+    or None. If node_ids is a non-empty list, returns
+    ``{"node_ids": [...]}``; otherwise returns ``{"all": True}``.
     """
-    if settings and settings.node_ids:
-        return {"node_ids": list(settings.node_ids)}
+    node_ids = getattr(source, "node_ids", None) if source else None
+    if node_ids:
+        return {"node_ids": list(node_ids)}
     return {"all": True}
 
 
@@ -56,16 +57,6 @@ class PingachockService:
         settings = await self.get_settings(org_id)
         if settings:
             settings.api_key = api_key
-            await self._session.commit()
-
-    async def update_node_ids(self, org_id: int, node_ids: list[str] | None) -> None:
-        """Set the list of Pingachock node UUIDs to use for checks.
-
-        Pass an empty list or None to reset to "all nodes".
-        """
-        settings = await self.get_settings(org_id)
-        if settings:
-            settings.node_ids = node_ids if node_ids else None
             await self._session.commit()
 
     async def delete_settings(self, org_id: int) -> None:

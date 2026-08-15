@@ -32,6 +32,7 @@ from bot.keyboards.inline import (
     mpool_detail_kb,
     mpool_ip_sets_kb,
     mpool_list_kb,
+    mpool_nodes_kb,
     mpool_tags_kb,
 )
 from bot.states.managed_pool import ManagedPoolFSM
@@ -41,6 +42,8 @@ from db.models.user import User
 from services.audit_service import send_audit
 from services.ip_set_service import IpSetService
 from services.managed_pool_service import ManagedPoolService
+from services.pingachock_api_service import PingachockAPIError, get_nodes
+from services.pingachock_service import PingachockService
 from services.remnawave_api_service import RemnaWaveAPIError, get_hosts, update_host_address
 from services.remnawave_service import RemnaWaveService
 
@@ -700,3 +703,158 @@ async def mpool_back(
     else:
         await state.clear()
         await _show_pool_list(call, session, active_org)
+
+
+# ── node selection ─────────────────────────────────────────────────────────────
+
+def _nodes_text(pool_name: str, selected_ids: list[str]) -> str:
+    if selected_ids:
+        return (
+            f"📡 <b>Узлы сканирования — «{pool_name}»</b>\n\n"
+            f"Выбрано: <b>{len(selected_ids)}</b> узл(а).\n"
+            "Только они будут использоваться при проверке этого пула.\n\n"
+            "Нажмите на узел чтобы включить/отключить, затем «💾 Сохранить»."
+        )
+    return (
+        f"📡 <b>Узлы сканирования — «{pool_name}»</b>\n\n"
+        "Фильтр не задан — используются <b>все доступные узлы</b>.\n\n"
+        "Нажмите на узел чтобы включить его в фильтр, затем «💾 Сохранить»."
+    )
+
+
+@router.callback_query(F.data.regexp(r"^mpool:nodes:\d+$"))
+async def mpool_nodes_menu(
+    call: CallbackQuery,
+    state: FSMContext,
+    active_org: Organization,
+    session: AsyncSession,
+) -> None:
+    await call.answer()
+    pool_id = int(call.data.split(":")[2])
+    pool_svc = ManagedPoolService(session)
+    pool = await pool_svc.get_pool(pool_id, active_org.id)
+    if not pool:
+        await call.answer("Пул не найден.", show_alert=True)
+        return
+
+    pc_svc = PingachockService(session)
+    pc = await pc_svc.get_settings(active_org.id)
+    if not pc:
+        await call.answer("Pingachock не настроен.", show_alert=True)
+        return
+
+    await call.message.edit_text("⏳ Загружаю список узлов...")
+    try:
+        nodes = await get_nodes(pc.api_url, pc.api_key)
+    except PingachockAPIError as e:
+        await call.answer(f"❌ Не удалось получить узлы: {str(e)[:200]}", show_alert=True)
+        await call.message.edit_text(
+            f"⚙️ <b>Пул «{pool.name}»</b>",
+            reply_markup=mpool_detail_kb(pool_id),
+            parse_mode="HTML",
+        )
+        return
+
+    # Exclude virtual nodes ("server") — they have unrestricted access and give wrong results
+    nodes = [n for n in nodes if not n.get("is_virtual", False)]
+
+    current_ids: list[str] = list(pool.node_ids or [])
+    await state.set_state(ManagedPoolFSM.selecting_nodes)
+    await state.update_data(pool_id=pool_id, pool_name=pool.name, nodes=nodes, selected_ids=current_ids)
+
+    await call.message.edit_text(
+        _nodes_text(pool.name, current_ids),
+        reply_markup=mpool_nodes_kb(pool_id, nodes, set(current_ids)),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(ManagedPoolFSM.selecting_nodes, F.data.regexp(r"^mpool:node_toggle:\d+:"))
+async def mpool_node_toggle(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    # callback_data: mpool:node_toggle:{pool_id}:{node_uuid}
+    parts = call.data.split(":", 3)
+    pool_id = int(parts[2])
+    node_id = parts[3]
+
+    data = await state.get_data()
+    nodes: list[dict] = data.get("nodes", [])
+    selected: list[str] = list(data.get("selected_ids", []))
+    pool_name: str = data.get("pool_name", "")
+
+    if node_id in selected:
+        selected.remove(node_id)
+    else:
+        selected.append(node_id)
+
+    await state.update_data(selected_ids=selected)
+    await call.message.edit_text(
+        _nodes_text(pool_name, selected),
+        reply_markup=mpool_nodes_kb(pool_id, nodes, set(selected)),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(ManagedPoolFSM.selecting_nodes, F.data.regexp(r"^mpool:nodes_all:\d+$"))
+async def mpool_nodes_use_all(
+    call: CallbackQuery,
+    state: FSMContext,
+    active_org: Organization,
+    session: AsyncSession,
+) -> None:
+    """Clear node filter for this pool — use all nodes."""
+    await call.answer()
+    data = await state.get_data()
+    pool_id: int = data.get("pool_id", int(call.data.split(":")[2]))
+
+    pool_svc = ManagedPoolService(session)
+    await pool_svc.update_node_ids(pool_id, active_org.id, None)
+    await state.clear()
+
+    await call.message.edit_text(
+        "✅ Фильтр узлов снят — будут использоваться <b>все доступные узлы</b>.",
+        parse_mode="HTML",
+    )
+    # Refresh detail view
+    pool = await pool_svc.get_pool(pool_id, active_org.id)
+    if pool:
+        await call.message.answer(
+            f"⚙️ <b>Пул «{pool.name}»</b>",
+            reply_markup=mpool_detail_kb(pool_id),
+            parse_mode="HTML",
+        )
+
+
+@router.callback_query(ManagedPoolFSM.selecting_nodes, F.data.regexp(r"^mpool:nodes_save:\d+$"))
+async def mpool_nodes_save(
+    call: CallbackQuery,
+    state: FSMContext,
+    active_org: Organization,
+    session: AsyncSession,
+) -> None:
+    await call.answer()
+    data = await state.get_data()
+    pool_id: int = data.get("pool_id", int(call.data.split(":")[2]))
+    selected: list[str] = data.get("selected_ids", [])
+
+    pool_svc = ManagedPoolService(session)
+    await pool_svc.update_node_ids(pool_id, active_org.id, selected if selected else None)
+    await state.clear()
+
+    if selected:
+        await call.message.edit_text(
+            f"✅ Сохранено. Узлов для этого пула: <b>{len(selected)}</b>.",
+            parse_mode="HTML",
+        )
+    else:
+        await call.message.edit_text(
+            "✅ Фильтр снят — используются <b>все доступные узлы</b>.",
+            parse_mode="HTML",
+        )
+    pool = await pool_svc.get_pool(pool_id, active_org.id)
+    if pool:
+        await call.message.answer(
+            f"⚙️ <b>Пул «{pool.name}»</b>",
+            reply_markup=mpool_detail_kb(pool_id),
+            parse_mode="HTML",
+        )

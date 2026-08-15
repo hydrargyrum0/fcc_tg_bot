@@ -89,40 +89,9 @@ def pingachock_configured_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔑 Изменить ключ", callback_data="pc:edit_key"),
         ],
         [InlineKeyboardButton(text="🔄 Проверить соединение", callback_data="pc:test")],
-        [InlineKeyboardButton(text="📡 Узлы сканирования", callback_data="pc:nodes")],
         [InlineKeyboardButton(text="🗑 Отключить", callback_data="pc:delete")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:settings")],
     ])
-
-
-def pc_nodes_kb(
-    nodes: list[dict],
-    selected_ids: set[str],
-) -> InlineKeyboardMarkup:
-    """Toggle keyboard for Pingachock node selection.
-
-    Each node row shows ✅/☐ + name (ISP, city). Two action rows at the bottom:
-    "Использовать все" clears the filter, "💾 Сохранить" commits.
-    """
-    rows: list[list[InlineKeyboardButton]] = []
-    for node in nodes:
-        node_id = node["id"]
-        mark = "✅" if node_id in selected_ids else "☐"
-        label = f"{mark} {node.get('name', node_id)}"
-        isp = node.get("isp", "")
-        city = node.get("city", "")
-        if isp or city:
-            label += f" ({', '.join(filter(None, [isp, city]))})"
-        rows.append([InlineKeyboardButton(
-            text=label,
-            callback_data=f"pc:node_toggle:{node_id}",
-        )])
-    rows.append([
-        InlineKeyboardButton(text="🌐 Использовать все", callback_data="pc:nodes_all"),
-        InlineKeyboardButton(text="💾 Сохранить", callback_data="pc:nodes_save"),
-    ])
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="pc:nodes_back")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def pingachock_cancel_kb() -> InlineKeyboardMarkup:
@@ -689,11 +658,39 @@ def mpool_detail_kb(pool_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Запустить проверку", callback_data=f"mpool:scan:{pool_id}")],
         [InlineKeyboardButton(text="📋 Список адресов", callback_data=f"mpool:ips:{pool_id}")],
+        [InlineKeyboardButton(text="📡 Узлы сканирования", callback_data=f"mpool:nodes:{pool_id}")],
         [InlineKeyboardButton(text="🧹 Очистить пул", callback_data=f"mpool:clear_confirm:{pool_id}")],
         [InlineKeyboardButton(text="⚡ Применить к автоматизациям", callback_data=f"mpool:force_apply:{pool_id}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"mpool:delete_confirm:{pool_id}")],
         [InlineKeyboardButton(text="◀️ К списку пулов", callback_data="mpool:list")],
     ])
+
+
+def mpool_nodes_kb(
+    pool_id: int,
+    nodes: list[dict],
+    selected_ids: set[str],
+) -> InlineKeyboardMarkup:
+    """Toggle keyboard for per-pool Pingachock node selection."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for node in nodes:
+        node_id = node["id"]
+        mark = "✅" if node_id in selected_ids else "☐"
+        label = f"{mark} {node.get('name', node_id)}"
+        isp = node.get("isp", "")
+        city = node.get("city", "")
+        if isp or city:
+            label += f" ({', '.join(filter(None, [isp, city]))})"
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"mpool:node_toggle:{pool_id}:{node_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton(text="🌐 Использовать все", callback_data=f"mpool:nodes_all:{pool_id}"),
+        InlineKeyboardButton(text="💾 Сохранить", callback_data=f"mpool:nodes_save:{pool_id}"),
+    ])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"mpool:detail:{pool_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def mpool_delete_confirm_kb(pool_id: int) -> InlineKeyboardMarkup:

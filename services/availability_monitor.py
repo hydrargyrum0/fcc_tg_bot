@@ -211,6 +211,12 @@ async def _do_process_group(
         ip_svc = IpSetService(session)
         sets = await ip_svc.get_sets_by_ids(list(group.ip_set_ids))
 
+        # Fetch managed pool (if any) to read its per-pool node_ids filter
+        managed_pool = None
+        if group.managed_pool_id:
+            pool_svc = ManagedPoolService(session)
+            managed_pool = await pool_svc.get_pool_any(group.managed_pool_id)
+
         mem_result = await session.execute(
             select(OrganizationMember.user_id).where(
                 OrganizationMember.org_id == group.org_id
@@ -263,7 +269,8 @@ async def _do_process_group(
 
     logger.info("Group %d: checking current IPs: %s", group_id, unique_current_ips)
 
-    node_selector = build_node_selector(pc)
+    # Node filter: per-pool setting (if group uses managed pool), else all nodes
+    node_selector = build_node_selector(managed_pool)
     ping_res_or_exc, tls_res_or_exc = await asyncio.gather(
         distributed_ping_check(pc.api_url, pc.api_key, unique_current_ips,
                                node_selector=node_selector),

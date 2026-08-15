@@ -68,6 +68,21 @@ class ManagedPoolService:
         await self._s.refresh(pool)
         return pool
 
+    async def update_node_ids(
+        self, pool_id: int, org_id: int, node_ids: list[str] | None
+    ) -> bool:
+        """Set (or clear) the list of Pingachock node UUIDs for this pool.
+
+        Returns False if pool not found or doesn't belong to org.
+        Pass None or [] to reset to "all nodes".
+        """
+        pool = await self.get_pool(pool_id, org_id)
+        if not pool:
+            return False
+        pool.node_ids = node_ids if node_ids else None
+        await self._s.commit()
+        return True
+
     async def delete_pool(self, pool_id: int, org_id: int) -> bool:
         pool = await self.get_pool(pool_id, org_id)
         if not pool:
