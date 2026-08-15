@@ -18,8 +18,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from db.models.managed_pool import ManagedIp, ManagedPool
 from services.ip_check_service import (
-    CHECK_BATCH, POLL_INTERVAL as _CHECK_POLL_INTERVAL, POLL_TIMEOUT,
-    distributed_ping_check, normalize_addresses, poll_batch,
+    CHECK_BATCH, EXCLUDED_NODES, POLL_INTERVAL as _CHECK_POLL_INTERVAL, POLL_TIMEOUT,
+    distributed_ping_check, normalize_addresses, poll_batch, run_node_name,
 )
 from services.ip_set_service import IpSetService
 from services.managed_pool_service import ManagedPoolService
@@ -119,19 +119,37 @@ async def _tls_check_batch(
         if status not in ("completed", "partial", "failed", "cancelled"):
             results[ip] = (None, None)   # timed out — unknown, not failed
             continue
-        ok = status in ("completed", "partial")
+
+        # Exclude "server" node — see EXCLUDED_NODES in ip_check_service
+        all_runs = fetch.get("runs", [])
+        work_runs = [r for r in all_runs if run_node_name(r) not in EXCLUDED_NODES]
+        if not work_runs:
+            # Only the backend "server" node responded — treat as unknown
+            results[ip] = (None, None)
+            continue
+
+        # TLS ok: at least one included done run has a positive handshake RTT
+        done_runs = [r for r in work_runs if r.get("status") == "done"]
         rtt: float | None = None
-        for run in fetch.get("runs", []):
+        for run in done_runs:
             r = run.get("result") or {}
             for key in ("latency_ms", "handshake_ms", "duration_ms", "rtt_ms"):
-                if r.get(key) is not None:
+                v = r.get(key)
+                if v is not None:
                     try:
-                        rtt = float(r[key])
+                        rtt = float(v)
                     except (ValueError, TypeError):
                         pass
                     break
             if rtt is not None:
                 break
+
+        ok: bool | None
+        if done_runs:
+            ok = rtt is not None and rtt > 0
+        else:
+            ok = None   # no included runs completed
+
         results[ip] = (ok, rtt)
     return results
 

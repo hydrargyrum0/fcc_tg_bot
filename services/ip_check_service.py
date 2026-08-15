@@ -216,6 +216,44 @@ async def distributed_check(
     return ip_ok
 
 
+# ── node exclusion ────────────────────────────────────────────────────────────
+
+EXCLUDED_NODES: frozenset[str] = frozenset({"server"})
+"""Pingachock node names to exclude from all check results.
+
+The 'server' node runs pings directly from the Pingachock backend host, which
+has unrestricted network access and reports IPs as reachable even when real
+distributed nodes cannot reach them.  Excluding it ensures reachability and
+quality metrics reflect actual user-facing conditions.
+"""
+
+
+def run_node_name(run: dict) -> str:
+    """Extract lower-cased node name from a check-run dict."""
+    node = run.get("node") or run.get("node_name") or ""
+    if isinstance(node, dict):
+        return str(node.get("name") or node.get("id") or "").lower()
+    return str(node).lower()
+
+
+def _ping_run_ok(run: dict) -> bool:
+    """True if a done ping run shows the target was reachable."""
+    raw = (run.get("result") or {}).get("raw") or {}
+    recv = raw.get("packets_recv") or raw.get("received") or raw.get("PacketsRecv")
+    if recv is not None:
+        return int(recv) > 0
+    # No packet counts — positive RTT implies success
+    for key in ("avg_rtt", "rtt_avg", "avg_ms", "AvgRtt", "rtt"):
+        v = raw.get(key)
+        if v is not None:
+            try:
+                if float(v) > 0:
+                    return True
+            except (ValueError, TypeError):
+                pass
+    return False
+
+
 async def distributed_ping_check(
     api_url: str,
     api_key: str,
@@ -272,13 +310,30 @@ async def distributed_ping_check(
             # Check timed out — we genuinely don't know; do NOT treat as failure
             results[ip] = (None, None, None)
             continue
-        reachable = status in ("completed", "partial")
+
+        # Only use runs from non-excluded nodes.
+        # "server" runs from the backend host and sees all IPs as reachable,
+        # which would mask real failures on distributed nodes.
+        all_runs = check_data.get("runs", [])
+        work_runs = [r for r in all_runs if run_node_name(r) not in EXCLUDED_NODES]
+        if not work_runs:
+            # No distributed-node runs (all excluded) — result is unknown
+            results[ip] = (None, None, None)
+            continue
+
+        # Derive reachability from done runs only
+        done_runs = [r for r in work_runs if r.get("status") == "done"]
+        if done_runs:
+            reachable: bool | None = any(_ping_run_ok(r) for r in done_runs)
+        else:
+            reachable = None   # distributed nodes didn't complete
+
         total_sent = 0
         total_recv = 0
         total_rtt_sum = 0.0
         rtt_count = 0
 
-        for run in check_data.get("runs", []):
+        for run in work_runs:
             if run.get("status") != "done":
                 continue
             result = run.get("result") or {}
