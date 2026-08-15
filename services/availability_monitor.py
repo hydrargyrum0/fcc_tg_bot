@@ -69,10 +69,14 @@ async def run_group_check_now(bot: "Bot", group_id: int) -> None:
     """Fire an immediate check for a newly created automation group.
 
     Safe to call from FSM handlers: creates a background asyncio task and
-    returns immediately.  No-ops silently if init() was not called yet.
+    returns immediately.  No-ops silently if init() was not called yet
+    or if the group is already being processed.
     """
     if _session_factory is None:
         logger.warning("run_group_check_now: session_factory not initialised (call init first)")
+        return
+    if group_id in _processing_groups:
+        logger.info("run_group_check_now: group %d already in-flight, skipping", group_id)
         return
     asyncio.create_task(
         _process_group(bot, _session_factory, group_id),
