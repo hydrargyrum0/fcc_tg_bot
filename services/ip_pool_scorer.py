@@ -33,7 +33,9 @@ TLS_TARGET = "kremnezar.online"
 TLS_PORT = 443
 POOL_SCORE_BATCH = 50        # IPs per Pingachock batch for pool scoring (vs CHECK_BATCH=5 for monitor)
 
-_scoring_pools: set[int] = set()   # pool IDs currently being scored (in-flight guard)
+_scoring_pools: set[int] = set()        # pool IDs currently being full-scored
+_health_checking_pools: set[int] = set()  # pool IDs currently being health-checked
+_health_check_times: dict[int, float] = {}  # pool_id → monotonic time of last health check
 
 
 # ── scoring formula ───────────────────────────────────────────────────────────
@@ -153,8 +155,28 @@ async def run_ip_pool_scorer(session_factory: async_sessionmaker) -> None:
                         _score_pool_safe(session_factory, pool.id),
                         name=f"pool-scorer-{pool.id}",
                     )
+            # Health checks: re-verify only approved IPs between full scans
+            try:
+                all_pools = await _get_all_enabled_pools(session_factory)
+                for pool in all_pools:
+                    if pool.id in _scoring_pools or pool.id in _health_checking_pools:
+                        continue
+                    health_interval_s = max(15, pool.check_interval_minutes // 3) * 60
+                    last_hc = _health_check_times.get(pool.id, 0.0)
+                    if time.monotonic() - last_hc >= health_interval_s:
+                        asyncio.create_task(
+                            _health_check_pool_safe(session_factory, pool.id),
+                            name=f"pool-health-{pool.id}",
+                        )
+            except Exception:
+                logger.exception("IP pool scorer: error in health-check loop")
         except Exception:
             logger.exception("IP pool scorer: error in main loop")
+
+
+async def _get_all_enabled_pools(session_factory: async_sessionmaker) -> list[ManagedPool]:
+    async with session_factory() as session:
+        return await ManagedPoolService(session).get_all_enabled()
 
 
 async def _get_due_pools(session_factory: async_sessionmaker) -> list[ManagedPool]:
@@ -185,6 +207,130 @@ async def _score_pool_safe(session_factory: async_sessionmaker, pool_id: int) ->
         logger.exception("IP pool scorer: error scoring pool %d", pool_id)
     finally:
         _scoring_pools.discard(pool_id)
+
+
+async def _health_check_pool_safe(session_factory: async_sessionmaker, pool_id: int) -> None:
+    """Guard wrapper for health checks — prevents concurrent runs per pool."""
+    _health_checking_pools.add(pool_id)
+    _health_check_times[pool_id] = time.monotonic()
+    try:
+        await _health_check_pool(session_factory, pool_id)
+    except Exception:
+        logger.exception("IP pool scorer: error health-checking pool %d", pool_id)
+    finally:
+        _health_checking_pools.discard(pool_id)
+
+
+async def _health_check_pool(session_factory: async_sessionmaker, pool_id: int) -> None:
+    """Re-verify approved IPs only — runs between full scans.
+
+    Faster than a full re-scan: checks only approved IPs, skips pending/rejected.
+    Approved IPs that drop below threshold get their approval revoked; their
+    metrics are always refreshed. Non-approved IPs are not touched (full scan
+    handles those on the next cycle).
+    """
+    from sqlalchemy import select as _select
+
+    async with session_factory() as session:
+        pool_svc = ManagedPoolService(session)
+        pool = await pool_svc.get_pool_any(pool_id)
+        if not pool or not pool.enabled:
+            return
+        approved_rows = await pool_svc.get_approved_ips(pool_id)
+        pc_svc = PingachockService(session)
+        pc = await pc_svc.get_settings(pool.org_id)
+        threshold = pool.score_threshold
+
+    if not pc:
+        logger.warning("Pool %d health check: Pingachock not configured", pool_id)
+        return
+
+    if not approved_rows:
+        logger.debug("Pool %d «%s»: health check — no approved IPs", pool_id, pool.name)
+        return
+
+    ips = [m.ip for m in approved_rows]
+    total_batches = (len(ips) + POOL_SCORE_BATCH - 1) // POOL_SCORE_BATCH
+    t0 = time.monotonic()
+    logger.info(
+        "Pool %d «%s»: health check — %d approved IPs, %d batches",
+        pool_id, pool.name, len(ips), total_batches,
+    )
+
+    revoked = 0
+    for batch_num, batch_start in enumerate(range(0, len(ips), POOL_SCORE_BATCH), 1):
+        batch = ips[batch_start: batch_start + POOL_SCORE_BATCH]
+        batch_t0 = time.monotonic()
+
+        ping_res_or_exc, tls_res_or_exc = await asyncio.gather(
+            distributed_ping_check(pc.api_url, pc.api_key, batch),
+            _tls_check_batch(pc.api_url, pc.api_key, batch),
+            return_exceptions=True,
+        )
+        ping_batch: dict[str, tuple[bool | None, float | None, float | None]] = (
+            ping_res_or_exc if not isinstance(ping_res_or_exc, Exception)
+            else {ip: (None, None, None) for ip in batch}
+        )
+        tls_batch: dict[str, tuple[bool | None, float | None]] = (
+            tls_res_or_exc if not isinstance(tls_res_or_exc, Exception)
+            else {ip: (None, None) for ip in batch}
+        )
+
+        b_revoked = b_kept = b_skipped = 0
+        async with session_factory() as session:
+            pool_svc = ManagedPoolService(session)
+            for ip in batch:
+                tls_ok, tls_ms = tls_batch.get(ip, (None, None))
+                ping_ok, ping_loss, ping_rtt = ping_batch.get(ip, (None, None, None))
+
+                if tls_ok is None:
+                    b_skipped += 1
+                    continue  # TLS timeout — preserve approval, retry on next cycle
+
+                score = compute_score(tls_ok, tls_ms, ping_loss, ping_rtt)
+                now_approved = score >= threshold
+
+                result = await session.execute(
+                    _select(ManagedIp).where(
+                        ManagedIp.pool_id == pool_id, ManagedIp.ip == ip,
+                    )
+                )
+                managed = result.scalar_one_or_none()
+                if not managed:
+                    continue
+
+                was_approved = managed.is_approved   # save before update mutates it
+                await pool_svc.update_ip_score(
+                    managed, score, now_approved,
+                    ping_rtt, ping_loss, tls_ok, tls_ms,
+                    vless_ok=None, vless_speed_mbps=None,
+                )
+
+                if was_approved and not now_approved:
+                    b_revoked += 1
+                    revoked += 1
+                    logger.debug(
+                        "Pool %d: %s — health REVOKED (score=%.0f, TLS=%s, RTT=%s, loss=%s)",
+                        pool_id, ip, score,
+                        "OK" if tls_ok else "FAIL",
+                        f"{ping_rtt:.0f}ms" if ping_rtt is not None else "?",
+                        f"{ping_loss * 100:.0f}%" if ping_loss is not None else "?",
+                    )
+                else:
+                    b_kept += 1
+
+        logger.debug(
+            "Pool %d: health batch %d/%d [%.0fs] — kept %d, revoked %d, skipped %d",
+            pool_id, batch_num, total_batches,
+            time.monotonic() - batch_t0, b_kept, b_revoked, b_skipped,
+        )
+
+    elapsed = time.monotonic() - t0
+    m, s = divmod(int(elapsed), 60)
+    logger.info(
+        "Pool %d «%s»: health check done in %dm%02ds — %d/%d approved (%d revoked)",
+        pool_id, pool.name, m, s, len(ips) - revoked, len(ips), revoked,
+    )
 
 
 async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None:  # noqa: C901

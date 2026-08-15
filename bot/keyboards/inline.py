@@ -658,6 +658,8 @@ def mpool_detail_kb(pool_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Запустить проверку", callback_data=f"mpool:scan:{pool_id}")],
         [InlineKeyboardButton(text="📋 Список адресов", callback_data=f"mpool:ips:{pool_id}")],
+        [InlineKeyboardButton(text="🧹 Очистить пул", callback_data=f"mpool:clear_confirm:{pool_id}")],
+        [InlineKeyboardButton(text="⚡ Применить к автоматизациям", callback_data=f"mpool:force_apply:{pool_id}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"mpool:delete_confirm:{pool_id}")],
         [InlineKeyboardButton(text="◀️ К списку пулов", callback_data="mpool:list")],
     ])
@@ -666,6 +668,13 @@ def mpool_detail_kb(pool_id: int) -> InlineKeyboardMarkup:
 def mpool_delete_confirm_kb(pool_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"mpool:delete:{pool_id}")],
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"mpool:detail:{pool_id}")],
+    ])
+
+
+def mpool_clear_confirm_kb(pool_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, очистить", callback_data=f"mpool:clear:{pool_id}")],
         [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"mpool:detail:{pool_id}")],
     ])
 

@@ -16,6 +16,8 @@ UI flow:
 """
 from __future__ import annotations
 
+import logging
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
@@ -24,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.keyboards.inline import (
     mpool_cancel_kb,
+    mpool_clear_confirm_kb,
     mpool_confirm_kb,
     mpool_delete_confirm_kb,
     mpool_detail_kb,
@@ -38,9 +41,10 @@ from db.models.user import User
 from services.audit_service import send_audit
 from services.ip_set_service import IpSetService
 from services.managed_pool_service import ManagedPoolService
-from services.remnawave_api_service import RemnaWaveAPIError, get_hosts
+from services.remnawave_api_service import RemnaWaveAPIError, get_hosts, update_host_address
 from services.remnawave_service import RemnaWaveService
 
+logger = logging.getLogger(__name__)
 router = Router()
 
 
@@ -248,6 +252,149 @@ async def mpool_delete(
     await svc.delete_pool(pool_id, active_org.id)
     send_audit(call.bot, active_org.id, db_user, f"Удалил управляемый пул: {name}")
     await _show_pool_list(call, session, active_org)
+
+
+# ── pool clear ───────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.regexp(r"^mpool:clear_confirm:\d+$"))
+async def mpool_clear_confirm(
+    call: CallbackQuery, session: AsyncSession, active_org: Organization,
+) -> None:
+    await call.answer()
+    pool_id = int(call.data.split(":")[2])
+    svc = ManagedPoolService(session)
+    pool = await svc.get_pool(pool_id, active_org.id)
+    if not pool:
+        await call.answer("Пул не найден.", show_alert=True)
+        return
+    stats = await svc.get_pool_stats(pool_id)
+    await call.message.edit_text(
+        f"🧹 <b>Очистить пул «{pool.name}»?</b>\n\n"
+        f"Будут удалены все {stats['total']} IP-адресов "
+        f"({stats['approved']} одобренных, {stats['pending']} ожидают, {stats['rejected']} отклонённых).\n\n"
+        f"Пул будет пересобран с нуля при следующей проверке.",
+        reply_markup=mpool_clear_confirm_kb(pool_id),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.regexp(r"^mpool:clear:\d+$"))
+async def mpool_clear(
+    call: CallbackQuery,
+    session: AsyncSession,
+    active_org: Organization,
+    db_user: User,
+) -> None:
+    await call.answer()
+    pool_id = int(call.data.split(":")[2])
+    svc = ManagedPoolService(session)
+    pool = await svc.get_pool(pool_id, active_org.id)
+    if not pool:
+        await call.answer("Пул не найден.", show_alert=True)
+        return
+    deleted = await svc.clear_pool_ips(pool_id)
+    send_audit(call.bot, active_org.id, db_user, f"Очистил пул «{pool.name}»: удалено {deleted} IP")
+    await call.answer(
+        f"🧹 Удалено {deleted} адресов. Пул будет пересобран автоматически.",
+        show_alert=True,
+    )
+    await _show_pool_list(call, session, active_org)
+
+
+# ── force apply automation groups ────────────────────────────────────────────
+
+@router.callback_query(F.data.regexp(r"^mpool:force_apply:\d+$"))
+async def mpool_force_apply(
+    call: CallbackQuery,
+    session: AsyncSession,
+    active_org: Organization,
+    db_user: User,
+) -> None:
+    await call.answer()
+    pool_id = int(call.data.split(":")[2])
+    svc = ManagedPoolService(session)
+    pool = await svc.get_pool(pool_id, active_org.id)
+    if not pool:
+        await call.answer("Пул не найден.", show_alert=True)
+        return
+
+    approved = await svc.get_approved_ips(pool_id)
+    if not approved:
+        await call.answer("В пуле нет одобренных адресов.", show_alert=True)
+        return
+
+    from services.automation_service import AutomationService
+    auto_svc = AutomationService(session)
+    groups = await auto_svc.get_groups_by_pool(pool_id, active_org.id)
+    if not groups:
+        await call.answer("Нет автоматизаций, использующих этот пул.", show_alert=True)
+        return
+
+    status_msg = await call.message.answer(
+        f"⚡ Применяю адреса к {len(groups)} автоматизациям...",
+    )
+
+    rw_svc = RemnaWaveService(session)
+    ip_pool = [m.ip for m in approved]   # already sorted by score desc
+    lines: list[str] = []
+    total_updated = 0
+
+    for group in groups:
+        panel = await rw_svc.get_panel_by_id(group.panel_id, active_org.id)
+        if not panel:
+            lines.append(f"• [{group.host_tag}] ошибка: панель #{group.panel_id} не найдена")
+            continue
+
+        try:
+            all_hosts = await get_hosts(panel.url, panel.api_token)
+        except RemnaWaveAPIError as e:
+            lines.append(f"• [{group.host_tag}] ошибка API: {e}")
+            continue
+
+        hosts = [h for h in all_hosts if group.host_tag in (h.get("tags") or [])]
+        if not hosts:
+            lines.append(f"• [{group.host_tag}] хосты с тегом не найдены")
+            continue
+
+        updated = 0
+        errors = 0
+        if group.distribution == "same":
+            best_ip = ip_pool[0]
+            for host in hosts:
+                try:
+                    await update_host_address(panel.url, panel.api_token, host["uuid"], best_ip)
+                    updated += 1
+                except RemnaWaveAPIError as e:
+                    errors += 1
+                    logger.warning("Force-apply pool %d group %d host %s: %s", pool_id, group.id, host["uuid"], e)
+            result_label = f"→ {best_ip}  ({updated}/{len(hosts)} хостов)"
+        else:
+            # each: assign IPs in score order, cycling if hosts > pool size
+            for i, host in enumerate(hosts):
+                ip = ip_pool[i % len(ip_pool)]
+                try:
+                    await update_host_address(panel.url, panel.api_token, host["uuid"], ip)
+                    updated += 1
+                except RemnaWaveAPIError as e:
+                    errors += 1
+                    logger.warning("Force-apply pool %d group %d host %s: %s", pool_id, group.id, host["uuid"], e)
+            result_label = f"по одному  ({updated}/{len(hosts)} хостов)"
+
+        total_updated += updated
+        err_suffix = f", ошибок: {errors}" if errors else ""
+        lines.append(f"• [{group.host_tag}] {result_label}{err_suffix}")
+
+    body = "\n".join(lines) if lines else "Нет обновлённых групп."
+    await status_msg.edit_text(
+        f"⚡ <b>Пул «{pool.name}»</b> применён\n\n"
+        f"{body}\n\n"
+        f"✅ Итого обновлено хостов: <b>{total_updated}</b>",
+        parse_mode="HTML",
+    )
+    send_audit(
+        call.bot, active_org.id, db_user,
+        f"Принудительно применил пул «{pool.name}» к {len(groups)} группам, обновлено {total_updated} хостов",
+    )
 
 
 # ── FSM: create new pool ──────────────────────────────────────────────────────

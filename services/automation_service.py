@@ -11,6 +11,16 @@ class AutomationService:
     def __init__(self, session: AsyncSession) -> None:
         self._s = session
 
+    async def get_groups_by_pool(self, pool_id: int, org_id: int) -> list[AutomationGroup]:
+        """Automation groups for this org that source replacements from the given pool."""
+        result = await self._s.execute(
+            select(AutomationGroup).where(
+                AutomationGroup.managed_pool_id == pool_id,
+                AutomationGroup.org_id == org_id,
+            ).order_by(AutomationGroup.id)
+        )
+        return list(result.scalars().all())
+
     async def get_org_groups(self, org_id: int) -> list[AutomationGroup]:
         result = await self._s.execute(
             select(AutomationGroup)

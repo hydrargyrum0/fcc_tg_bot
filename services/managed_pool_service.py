@@ -179,6 +179,25 @@ class ManagedPoolService:
         managed_ip.last_checked_at = datetime.utcnow()
         await self._s.commit()
 
+    async def clear_pool_ips(self, pool_id: int) -> int:
+        """Delete all IPs from the pool and reset last_scanned_at.
+
+        The next scorer cycle will rebuild from scratch.
+        Returns number of deleted rows.
+        """
+        from sqlalchemy import func as _func
+        cnt = (await self._s.execute(
+            select(_func.count()).where(ManagedIp.pool_id == pool_id)
+        )).scalar_one()
+        await self._s.execute(delete(ManagedIp).where(ManagedIp.pool_id == pool_id))
+        await self._s.execute(
+            update(ManagedPool)
+            .where(ManagedPool.id == pool_id)
+            .values(last_scanned_at=None)
+        )
+        await self._s.commit()
+        return cnt
+
     async def remove_stale_ips(self, pool_id: int, current_ips: set[str]) -> int:
         """Delete IPs no longer present in any source set. Returns deleted count."""
         result = await self._s.execute(
