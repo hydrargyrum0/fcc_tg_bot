@@ -283,10 +283,22 @@ def run_node_name(run: dict) -> str:
     return str(node).lower()
 
 
+def _first_not_none(d: dict, *keys: str):
+    """Return the first value from d whose key is present (even if value is 0/0.0).
+
+    Unlike ``d.get(k1) or d.get(k2)``, this does not skip falsy values such
+    as 0 or 0.0 — critical for packet counts and RTT where 0 is meaningful.
+    """
+    for key in keys:
+        if key in d:
+            return d[key]
+    return None
+
+
 def _ping_run_ok(run: dict) -> bool:
     """True if a done ping run shows the target was reachable."""
     raw = (run.get("result") or {}).get("raw") or {}
-    recv = raw.get("packets_recv") or raw.get("received") or raw.get("PacketsRecv")
+    recv = _first_not_none(raw, "packets_recv", "received", "PacketsRecv")
     if recv is not None:
         return int(recv) > 0
     # No packet counts — positive RTT implies success
@@ -529,20 +541,20 @@ async def distributed_ping_check(
             raw = result.get("raw") or {}
 
             # Packet counts — only from nodes that report raw data.
-            # No fallback: if a node doesn't send packets, skip its loss data.
-            sent = (raw.get("packets_sent") or raw.get("sent") or raw.get("PacketsSent"))
-            recv = (raw.get("packets_recv") or raw.get("received") or
-                    raw.get("packets_received") or raw.get("PacketsRecv"))
+            # Use _first_not_none so that recv=0 is not skipped by `or`.
+            sent = _first_not_none(raw, "packets_sent", "sent", "PacketsSent")
+            recv = _first_not_none(raw, "packets_recv", "received",
+                                   "packets_received", "PacketsRecv")
             if sent is not None and recv is not None:
                 total_sent += int(sent)
                 total_recv += int(recv)
 
             # RTT — try common field name conventions.
+            # Use _first_not_none so that rtt=0 is not skipped by `or`.
             # Go time.Duration is nanoseconds; values ≥ 1_000_000 are converted to ms.
-            rtt_raw = (
-                raw.get("avg_rtt") or raw.get("rtt_avg") or raw.get("avg_ms") or
-                raw.get("AvgRtt") or raw.get("rtt") or raw.get("avg_latency") or
-                raw.get("latency_ms") or raw.get("latency")
+            rtt_raw = _first_not_none(
+                raw, "avg_rtt", "rtt_avg", "avg_ms",
+                "AvgRtt", "rtt", "avg_latency", "latency_ms", "latency",
             )
             if rtt_raw is not None:
                 try:
