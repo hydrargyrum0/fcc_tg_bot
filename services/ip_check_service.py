@@ -321,6 +321,7 @@ async def tls_check_batch(
     tls_port: int = TLS_CHECK_PORT,
     poll_timeout: float = POLL_TIMEOUT,
     poll_interval: float = POLL_INTERVAL,
+    node_selector: dict | None = None,
 ) -> dict[str, tuple[bool | None, float | None]]:
     """TLS handshake check for each IP against tls_host:tls_port.
 
@@ -331,9 +332,10 @@ async def tls_check_batch(
     """
     if not ips:
         return {}
+    ns = node_selector if node_selector is not None else {"all": True}
     try:
         resp = await create_check(
-            api_url, api_key, "tls", {"all": True},
+            api_url, api_key, "tls", ns,
             targets=ips,
             params={"port": tls_port, "sni": tls_host, "count": 2, "allow_insecure": True},
         )
@@ -417,6 +419,7 @@ async def distributed_ping_check(
     api_key: str,
     ips: list[str],
     *,
+    node_selector: dict | None = None,
     count: int = 4,
     poll_timeout: float = POLL_TIMEOUT,
     poll_interval: float = POLL_INTERVAL,
@@ -432,8 +435,9 @@ async def distributed_ping_check(
     if not ips:
         return {}
 
+    ns = node_selector if node_selector is not None else {"all": True}
     resp = await create_check(
-        api_url, api_key, "ping", {"all": True},
+        api_url, api_key, "ping", ns,
         targets=ips,
         params={"count": count, "timeout_ms": 3000},
     )

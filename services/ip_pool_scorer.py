@@ -26,7 +26,7 @@ from services.ip_check_service import (
 from services.ip_set_service import IpSetService
 from services.managed_pool_service import ManagedPoolService
 from services.pingachock_api_service import PingachockAPIError, create_check, get_check
-from services.pingachock_service import PingachockService
+from services.pingachock_service import PingachockService, build_node_selector
 
 logger = logging.getLogger(__name__)
 
@@ -194,14 +194,15 @@ async def _health_check_pool(session_factory: async_sessionmaker, pool_id: int) 
         pool_id, pool.name, len(ips), total_batches,
     )
 
+    node_selector = build_node_selector(pc)
     revoked = 0
     for batch_num, batch_start in enumerate(range(0, len(ips), POOL_SCORE_BATCH), 1):
         batch = ips[batch_start: batch_start + POOL_SCORE_BATCH]
         batch_t0 = time.monotonic()
 
         ping_res_or_exc, tls_res_or_exc = await asyncio.gather(
-            distributed_ping_check(pc.api_url, pc.api_key, batch),
-            tls_check_batch(pc.api_url, pc.api_key, batch),
+            distributed_ping_check(pc.api_url, pc.api_key, batch, node_selector=node_selector),
+            tls_check_batch(pc.api_url, pc.api_key, batch, node_selector=node_selector),
             return_exceptions=True,
         )
         ping_batch: dict[str, tuple[bool | None, float | None, float | None]] = (
@@ -348,6 +349,7 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
     from sqlalchemy import select as _select
     approved_count = 0
     skipped_count  = 0   # TLS timed out
+    node_selector = build_node_selector(pc)
 
     for batch_num, batch_start in enumerate(range(0, len(check_ips), POOL_SCORE_BATCH), 1):
         batch = check_ips[batch_start: batch_start + POOL_SCORE_BATCH]
@@ -355,8 +357,8 @@ async def _score_pool(session_factory: async_sessionmaker, pool_id: int) -> None
 
         # Ping + TLS in parallel — independent, no need to wait for each other
         ping_res_or_exc, tls_res_or_exc = await asyncio.gather(
-            distributed_ping_check(pc.api_url, pc.api_key, batch),
-            tls_check_batch(pc.api_url, pc.api_key, batch),
+            distributed_ping_check(pc.api_url, pc.api_key, batch, node_selector=node_selector),
+            tls_check_batch(pc.api_url, pc.api_key, batch, node_selector=node_selector),
             return_exceptions=True,
         )
 

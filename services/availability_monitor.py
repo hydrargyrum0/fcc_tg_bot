@@ -48,7 +48,7 @@ from services.ip_check_service import (
 from services.ip_set_service import IpSetService
 from services.managed_pool_service import ManagedPoolService
 from services.pingachock_api_service import PingachockAPIError
-from services.pingachock_service import PingachockService
+from services.pingachock_service import PingachockService, build_node_selector
 from services.remnawave_api_service import RemnaWaveAPIError, get_hosts, update_host_address
 from services.remnawave_service import RemnaWaveService
 
@@ -263,9 +263,12 @@ async def _do_process_group(
 
     logger.info("Group %d: checking current IPs: %s", group_id, unique_current_ips)
 
+    node_selector = build_node_selector(pc)
     ping_res_or_exc, tls_res_or_exc = await asyncio.gather(
-        distributed_ping_check(pc.api_url, pc.api_key, unique_current_ips),
-        tls_check_batch(pc.api_url, pc.api_key, unique_current_ips),
+        distributed_ping_check(pc.api_url, pc.api_key, unique_current_ips,
+                               node_selector=node_selector),
+        tls_check_batch(pc.api_url, pc.api_key, unique_current_ips,
+                        node_selector=node_selector),
         return_exceptions=True,
     )
 
@@ -365,6 +368,7 @@ async def _do_process_group(
                 reason="dead" if is_dead else "lossy",
                 current_loss_pct=current_loss_pct,
                 exclude_ips=bad_ips_to_skip | cooldown_ips,
+                node_selector=node_selector,
             )
         else:
             await _replace_ip_for_hosts(
@@ -380,6 +384,7 @@ async def _do_process_group(
                 member_ids=member_ids,
                 reason="dead" if is_dead else "lossy",
                 current_loss_pct=current_loss_pct,
+                node_selector=node_selector,
             )
     else:
         # "each" distribution — silent background maintenance, no Telegram alerts.
@@ -418,12 +423,14 @@ async def _do_process_group(
                 new_ip, loss_pct, rtt_ms, _speed = await _find_replacement_from_pool(
                     pc.api_url, pc.api_key, session_factory,
                     group.managed_pool_id, group.id, exclude,
+                    node_selector=node_selector,
                 )
             else:
                 new_ip, loss_pct, rtt_ms = await _find_replacement(
                     pc.api_url, pc.api_key, pool, group.id,
                     exclude_ips=exclude,
                     require_low_loss=require_low_loss,
+                    node_selector=node_selector,
                 )
 
             if new_ip:
@@ -469,6 +476,7 @@ async def _replace_ip_for_hosts(
     member_ids: list[int],
     reason: str = "dead",                  # "dead" — недоступен; "lossy" — высокие потери
     current_loss_pct: float | None = None, # потери текущего (плохого) IP, None если нет данных
+    node_selector: dict | None = None,
 ) -> None:
     """Send live alert, search for replacement, apply, edit alert with result."""
     start_t = time.monotonic()
@@ -571,6 +579,7 @@ async def _replace_ip_for_hosts(
             pc.api_url, pc.api_key, pool, group.id,
             exclude_ips=exclude_for_replacement,
             require_low_loss=require_low_loss,
+            node_selector=node_selector,
         )
         cancelled = group.id in _cancel_flags
         if cancelled:
@@ -657,6 +666,7 @@ async def _find_replacement_from_pool(
     pool_id: int,
     group_id: int,
     exclude_ips: frozenset[str],
+    node_selector: dict | None = None,
 ) -> tuple[str, float | None, float | None, float | None] | tuple[None, None, None, None]:
     """Get best replacement from a scored managed pool.
 
@@ -679,7 +689,8 @@ async def _find_replacement_from_pool(
         batch = filtered[i: i + CHECK_BATCH]
         batch_ips = [c.ip for c in batch]
         try:
-            ping_results = await distributed_ping_check(api_url, api_key, batch_ips)
+            ping_results = await distributed_ping_check(api_url, api_key, batch_ips,
+                                                        node_selector=node_selector)
         except PingachockAPIError as e:
             logger.warning("Pool %d: final ping batch failed: %s", pool_id, e)
             continue
@@ -710,6 +721,7 @@ async def _replace_ip_for_hosts_from_pool(
     reason: str = "dead",
     current_loss_pct: float | None = None,
     exclude_ips: frozenset[str] = frozenset(),
+    node_selector: dict | None = None,
 ) -> None:
     """Managed-pool variant of _replace_ip_for_hosts.
 
@@ -792,6 +804,7 @@ async def _replace_ip_for_hosts_from_pool(
         new_ip, new_loss_pct, new_rtt_ms, new_speed_mbps = await _find_replacement_from_pool(
             pc.api_url, pc.api_key, session_factory,
             group.managed_pool_id, group.id, exclude_ips,
+            node_selector=node_selector,
         )
         cancelled = group.id in _cancel_flags
         if cancelled:
@@ -867,6 +880,7 @@ async def _find_replacement(
     group_id: int,
     exclude_ips: frozenset[str] = frozenset(),
     require_low_loss: bool = False,
+    node_selector: dict | None = None,
 ) -> tuple[str, float | None, float | None] | tuple[None, None, None]:
     """Scan pool in batches, verify each candidate via a single ping check.
 
@@ -886,7 +900,8 @@ async def _find_replacement(
         if not batch:
             continue
         try:
-            results = await distributed_ping_check(api_url, api_key, batch)
+            results = await distributed_ping_check(api_url, api_key, batch,
+                                                   node_selector=node_selector)
         except Exception as e:
             logger.warning("Group %d: ping error during replacement search: %s", group_id, e)
             continue

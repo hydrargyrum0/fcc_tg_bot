@@ -22,7 +22,16 @@
       "Bash(curl -s \"https://pingachock.rapeer.com:30031/docs\" --max-time 15 -k)",
       "Bash(curl -s \"https://pingachock.rapeer.com:30031/docs/openapi.yaml\" --max-time 20 -k)",
       "Bash(not exist *)",
-      "Bash(dir docs\\\\superpowers\\\\specs)"
+      "Bash(dir docs\\\\superpowers\\\\specs)",
+      "Bash(python -m py_compile services/ip_check_service.py services/ip_pool_scorer.py services/availability_monitor.py)",
+      "Bash(curl -s https://remain.jancloud.online/api/sub/1sMCFP-Jd-5CSr7r/json -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1dWlkIjoiNTY1ZGM1NTItNjc0Zi00NThkLWI0OWEtMzBhN2E1OGZiMmMwIiwidXNlcm5hbWUiOm51bGwsInJvbGUiOiJBUEkiLCJpYXQiOjE3ODY3NDE3NDMsImV4cCI6MTc4NjgyODE0M30.oZNAe6oalUqf1gkQXzrkLuxjb-Mwm2wLqrGApfz1m6c')",
+      "Bash(python -m json.tool)",
+      "Bash(curl -sv https://remain.jancloud.online/api/users/by-short-uuid/1sMCFP-Jd-5CSr7r -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1dWlkIjoiNTY1ZGM1NTItNjc0Zi00NThkLWI0OWEtMzBhN2E1OGZiMmMwIiwidXNlcm5hbWUiOm51bGwsInJvbGUiOiJBUEkiLCJpYXQiOjE3ODY3NDE3NDMsImV4cCI6MTc4NjgyODE0M30.oZNAe6oalUqf1gkQXzrkLuxjb-Mwm2wLqrGApfz1m6c')",
+      "Bash(python -m py_compile db/models/managed_pool.py services/managed_pool_service.py services/remnawave_api_service.py services/ip_pool_scorer.py bot/states/managed_pool.py bot/handlers/managed_pool_fsm.py)",
+      "PowerShell(ssh root@89.23.100.142 \"cd /root/fcc_tg_bot && git pull && systemctl restart fcc-tg-bot && systemctl status fcc-tg-bot --no-pager -l | tail -20\")",
+      "PowerShell(ssh -o ConnectTimeout=10 root@89.23.100.142 \"cd /root/fcc_tg_bot && git pull --ff-only\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('services/ip_pool_scorer.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('services/ip_pool_scorer.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

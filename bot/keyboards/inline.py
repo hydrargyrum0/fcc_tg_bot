@@ -89,9 +89,40 @@ def pingachock_configured_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔑 Изменить ключ", callback_data="pc:edit_key"),
         ],
         [InlineKeyboardButton(text="🔄 Проверить соединение", callback_data="pc:test")],
+        [InlineKeyboardButton(text="📡 Узлы сканирования", callback_data="pc:nodes")],
         [InlineKeyboardButton(text="🗑 Отключить", callback_data="pc:delete")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:settings")],
     ])
+
+
+def pc_nodes_kb(
+    nodes: list[dict],
+    selected_ids: set[str],
+) -> InlineKeyboardMarkup:
+    """Toggle keyboard for Pingachock node selection.
+
+    Each node row shows ✅/☐ + name (ISP, city). Two action rows at the bottom:
+    "Использовать все" clears the filter, "💾 Сохранить" commits.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for node in nodes:
+        node_id = node["id"]
+        mark = "✅" if node_id in selected_ids else "☐"
+        label = f"{mark} {node.get('name', node_id)}"
+        isp = node.get("isp", "")
+        city = node.get("city", "")
+        if isp or city:
+            label += f" ({', '.join(filter(None, [isp, city]))})"
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"pc:node_toggle:{node_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton(text="🌐 Использовать все", callback_data="pc:nodes_all"),
+        InlineKeyboardButton(text="💾 Сохранить", callback_data="pc:nodes_save"),
+    ])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="pc:nodes_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def pingachock_cancel_kb() -> InlineKeyboardMarkup:
