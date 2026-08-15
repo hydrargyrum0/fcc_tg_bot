@@ -307,7 +307,18 @@ async def tls_check_batch(
         logger.warning("TLS batch check failed: %s", e)
         return {ip: (None, None) for ip in ips}
 
-    id_to_ip: dict[str, str] = {c["id"]: c["target"] for c in resp.get("checks", [])}
+    logger.info("tls_check_batch: create_check response keys=%s", list(resp.keys()))
+
+    # Handle both batch {"checks": [...]} and single-check {"id": ..., "target": ...}
+    id_to_ip: dict[str, str] = {}
+    if "checks" in resp:
+        id_to_ip = {c["id"]: c["target"] for c in resp["checks"]}
+    elif resp.get("id") and resp.get("target"):
+        id_to_ip = {resp["id"]: resp["target"]}
+    else:
+        logger.warning("tls_check_batch: unexpected response shape: %s", resp)
+        return {ip: (None, None) for ip in ips}
+
     batch_id = resp.get("batch_id")
 
     await poll_batch(api_url, api_key, batch_id, set(id_to_ip.keys()), poll_timeout, poll_interval)
@@ -393,11 +404,25 @@ async def distributed_ping_check(
         params={"count": count, "timeout_ms": 3000},
     )
 
+    logger.info("distributed_ping_check: create_check response keys=%s", list(resp.keys()))
+
+    # Pingachock may return a batch response {"checks": [...]} or a single-check
+    # response {"id": ..., "target": ...} when targets list has one item.
     id_to_ip: dict[str, str] = {}
-    for c in resp.get("checks", []):
-        id_to_ip[c["id"]] = c["target"]
+    if "checks" in resp:
+        for c in resp["checks"]:
+            id_to_ip[c["id"]] = c["target"]
+    elif resp.get("id") and resp.get("target"):
+        # Single-check response — treat as a batch of one
+        id_to_ip[resp["id"]] = resp["target"]
+    else:
+        logger.warning("distributed_ping_check: unexpected response shape: %s", resp)
 
     if not id_to_ip:
+        logger.warning(
+            "distributed_ping_check: no check IDs found in response — "
+            "returning UNKNOWN for %s", ips
+        )
         return {ip: (None, None, None) for ip in ips}
 
     batch_id = resp.get("batch_id")
