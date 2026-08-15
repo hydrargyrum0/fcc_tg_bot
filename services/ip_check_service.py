@@ -135,26 +135,48 @@ async def poll_batch(
     - "pending" / "running" (last seen) — checks still in-progress at timeout
 
     Callers must treat non-terminal statuses as **unknown**, never as "failed".
+
+    When batch_id is None (single-check response), polls each ID individually
+    via GET /checks/{id} instead of listing — avoids missing the check in a
+    large paginated list.
     """
     pending = set(check_ids)
     statuses: dict[str, str] = {cid: "pending" for cid in check_ids}
+    _TERMINAL = frozenset({"completed", "partial", "failed", "cancelled"})
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + poll_timeout
-    while pending and loop.time() < deadline:
-        await asyncio.sleep(poll_interval)
-        try:
-            checks = await list_checks(api_url, api_key, batch_id=batch_id, limit=200)
-        except PingachockAPIError:
-            continue
-        for c in checks:
-            cid = c["id"]
-            if cid not in pending:
+
+    if batch_id:
+        # Batch mode: list checks filtered by batch_id
+        while pending and loop.time() < deadline:
+            await asyncio.sleep(poll_interval)
+            try:
+                checks = await list_checks(api_url, api_key, batch_id=batch_id, limit=200)
+            except PingachockAPIError:
                 continue
-            status = c.get("status", "")
-            statuses[cid] = status
-            if status in ("completed", "partial", "failed", "cancelled"):
-                pending.discard(cid)
+            for c in checks:
+                cid = c["id"]
+                if cid not in pending:
+                    continue
+                status = c.get("status", "")
+                statuses[cid] = status
+                if status in _TERMINAL:
+                    pending.discard(cid)
+    else:
+        # Single-check mode: poll each ID directly via GET /checks/{id}
+        while pending and loop.time() < deadline:
+            await asyncio.sleep(poll_interval)
+            for cid in list(pending):
+                try:
+                    data = await get_check(api_url, api_key, cid)
+                except PingachockAPIError:
+                    continue
+                status = data.get("status", "")
+                statuses[cid] = status
+                if status in _TERMINAL:
+                    pending.discard(cid)
+
     return statuses
 
 
