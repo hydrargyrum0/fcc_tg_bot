@@ -59,6 +59,15 @@ class LightsailSearchService:
         )
         return list(res.scalars().all())
 
+    async def get_all_monitoring(self) -> list[LightsailRegionConfig]:
+        """Return all configs in 'monitoring' status (for periodic recheck)."""
+        res = await self._s.execute(
+            select(LightsailRegionConfig).where(
+                LightsailRegionConfig.status == "monitoring"
+            )
+        )
+        return list(res.scalars().all())
+
     async def upsert_config(
         self,
         org_id: int,

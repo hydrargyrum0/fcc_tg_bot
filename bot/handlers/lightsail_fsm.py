@@ -29,7 +29,7 @@ from db.models.organization import Organization
 from services.aws_service import AWSService
 from services.lightsail_api_service import get_regions
 from services.lightsail_search_service import LightsailSearchService
-from services.lightsail_searcher import is_running, start_search, stop_search
+from services.lightsail_searcher import is_running, notify_org, start_search, stop_search
 from services.pingachock_api_service import PingachockAPIError, get_nodes
 from services.pingachock_service import PingachockService
 
@@ -388,6 +388,15 @@ async def ls_pause(
     account = await AWSService(session).get_account_by_id(cfg.aws_account_id, active_org.id)
     working_ips = await svc.get_working_ips(config_id)
     all_ips = await svc.get_all_ips(config_id)
+
+    region_label = cfg.region_display_name or cfg.region
+    await notify_org(
+        cfg.org_id,
+        f"⏸ <b>Amazon Lightsail [{region_label}]</b> — поиск приостановлен\n"
+        f"Найдено: {len(working_ips)} из {cfg.target_count} · "
+        f"Проверено: {cfg.total_checked}",
+    )
+
     text = await _get_region_detail_text(
         cfg, working_ips, all_ips, account.tag if account else "?"
     )
@@ -438,6 +447,16 @@ async def ls_stop(
     cfg = await svc.get_config_by_id(config_id)
     working_ips = await svc.get_working_ips(config_id)
     all_ips = await svc.get_all_ips(config_id)
+
+    if cfg:
+        region_label = cfg.region_display_name or cfg.region
+        await notify_org(
+            cfg.org_id,
+            f"⏹ <b>Amazon Lightsail [{region_label}]</b> — поиск остановлен\n"
+            f"Найдено: {len(working_ips)} из {cfg.target_count} · "
+            f"Проверено: {cfg.total_checked}",
+        )
+
     text = await _get_region_detail_text(
         cfg, working_ips, all_ips, account.tag if account else "?"
     )
