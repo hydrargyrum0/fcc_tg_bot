@@ -14,6 +14,7 @@ from bot.handlers import (
     domains_fsm,
     hosts_fsm,
     ip_sets,
+    lightsail_fsm,
     managed_pool_fsm,
     member,
     monitoring,
@@ -32,6 +33,8 @@ from db.session import async_session_factory
 import services.availability_monitor as _avail_monitor
 from services.availability_monitor import run_availability_monitor
 from services.ip_pool_scorer import run_ip_pool_scorer
+import services.lightsail_searcher as _lightsail_searcher
+from services.lightsail_searcher import run_lightsail_searcher
 from services.monitoring_service import run_monitoring
 
 logging.basicConfig(level=logging.INFO)
@@ -61,6 +64,7 @@ async def main() -> None:
     dp.include_router(nodes_menu.router)
     dp.include_router(node_domain_fsm.router)
     dp.include_router(monitoring.router)
+    dp.include_router(lightsail_fsm.router)
     dp.include_router(common.router)
     dp.include_router(superadmin.router)
     dp.include_router(member.router)
@@ -69,6 +73,9 @@ async def main() -> None:
     # fire on-demand checks (e.g. immediately after group creation).
     _avail_monitor.init(async_session_factory)
 
+    # Initialise Lightsail searcher (resumes any in-progress searches on startup).
+    _lightsail_searcher.init(async_session_factory, bot)
+
     monitoring_task = asyncio.create_task(run_monitoring(bot, redis))
     availability_task = asyncio.create_task(
         run_availability_monitor(bot, async_session_factory)
@@ -76,12 +83,16 @@ async def main() -> None:
     pool_scorer_task = asyncio.create_task(
         run_ip_pool_scorer(async_session_factory)
     )
+    lightsail_task = asyncio.create_task(
+        run_lightsail_searcher(async_session_factory, bot)
+    )
     try:
         await dp.start_polling(bot)
     finally:
         monitoring_task.cancel()
         availability_task.cancel()
         pool_scorer_task.cancel()
+        lightsail_task.cancel()
         try:
             await monitoring_task
         except asyncio.CancelledError:
@@ -92,6 +103,10 @@ async def main() -> None:
             pass
         try:
             await pool_scorer_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await lightsail_task
         except asyncio.CancelledError:
             pass
         await redis.aclose()

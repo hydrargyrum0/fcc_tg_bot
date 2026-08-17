@@ -18,6 +18,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🤖 Автоматизации", callback_data="menu:automations"),
         ],
         [
+            InlineKeyboardButton(text="🔍 Автопоиск IP", callback_data="menu:ipsearch"),
+        ],
+        [
             InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings"),
         ],
         [
@@ -759,4 +762,118 @@ def avail_pools_kb(pools: list) -> InlineKeyboardMarkup:
         for p in pools
     ]
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="avail:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ── Lightsail IP search ────────────────────────────────────────────────────────
+
+def ipsearch_services_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔶 Amazon Lightsail", callback_data="ls:lightsail")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu:back")],
+    ])
+
+
+def ls_accounts_kb(accounts: list) -> InlineKeyboardMarkup:
+    """List of AWS accounts to pick for Lightsail search."""
+    rows = [
+        [InlineKeyboardButton(text=f"☁️ {acc.tag}", callback_data=f"ls:account:{acc.id}")]
+        for acc in accounts
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="ls:back_services")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+_STATUS_ICON = {
+    "searching": "🔴",
+    "paused":    "🟡",
+    "monitoring": "🟢",
+    "idle":      "⚪",
+}
+
+
+def ls_regions_kb(
+    account_id: int,
+    regions: list[dict],          # [{"name": "us-east-1", "displayName": "N. Virginia"}]
+    configs: dict[str, object],   # region_name → LightsailRegionConfig | None
+    working_counts: dict[str, int],
+) -> InlineKeyboardMarkup:
+    """Regions list with status indicators."""
+    rows = []
+    for r in regions:
+        rname = r["name"]
+        rdisplay = r.get("displayName", rname)
+        cfg = configs.get(rname)
+        if cfg:
+            icon = _STATUS_ICON.get(cfg.status, "⚪")
+            wc = working_counts.get(rname, 0)
+            target = cfg.target_count
+            label = f"{icon} {rdisplay} — {wc}/{target}"
+        else:
+            label = f"⚪ {rdisplay}"
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"ls:region:{account_id}:{rname}",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"ls:account_back:{account_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ls_region_detail_kb(
+    config_id: int,
+    status: str,
+    is_task_running: bool,
+) -> InlineKeyboardMarkup:
+    """Controls for one region config."""
+    rows = []
+
+    # Start / Pause / Stop
+    if status == "searching" and is_task_running:
+        rows.append([
+            InlineKeyboardButton(text="⏸ Пауза", callback_data=f"ls:pause:{config_id}"),
+            InlineKeyboardButton(text="⏹ Стоп", callback_data=f"ls:stop:{config_id}"),
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="▶️ Запустить", callback_data=f"ls:start:{config_id}"),
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="📡 Узлы Pingachock", callback_data=f"ls:nodes:{config_id}"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🎯 Цель", callback_data=f"ls:target:{config_id}"),
+        InlineKeyboardButton(text="⏱ Перепроверка", callback_data=f"ls:recheck:{config_id}"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"ls:refresh:{config_id}"),
+        InlineKeyboardButton(text="◀️ Назад", callback_data=f"ls:back_regions:{config_id}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ls_nodes_kb(
+    config_id: int,
+    nodes: list[dict],
+    selected_ids: set[str],
+) -> InlineKeyboardMarkup:
+    """Toggle keyboard for Pingachock node selection (per search config)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for node in nodes:
+        node_id = node["id"]
+        mark = "✅" if node_id in selected_ids else "☐"
+        label = f"{mark} {node.get('name', node_id)}"
+        isp = node.get("isp", "")
+        city = node.get("city", "")
+        if isp or city:
+            label += f" ({', '.join(filter(None, [isp, city]))})"
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"ls:node_toggle:{config_id}:{node_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton(text="🌐 Все узлы", callback_data=f"ls:nodes_all:{config_id}"),
+        InlineKeyboardButton(text="💾 Сохранить", callback_data=f"ls:nodes_save:{config_id}"),
+    ])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"ls:refresh:{config_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
