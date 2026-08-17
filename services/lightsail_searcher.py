@@ -59,7 +59,7 @@ from services.pingachock_service import PingachockService, build_node_selector
 logger = logging.getLogger(__name__)
 
 MAX_STATIC_IPS = 5
-ATTACH_WAIT_SECONDS = 35
+ATTACH_WAIT_SECONDS = 15
 WAKEUP_INTERVAL = 60
 LOSS_THRESHOLD_NORMAL = 0.0
 LOSS_THRESHOLD_RELAXED = 0.75
