@@ -1,7 +1,7 @@
 """DB service for Lightsail IP search configs and static IPs."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -91,7 +91,7 @@ class LightsailSearchService:
         if cfg:
             cfg.status = "searching"
             cfg.instance_name = instance_name
-            cfg.search_started_at = datetime.now(timezone.utc)
+            cfg.search_started_at = datetime.utcnow()
             cfg.total_checked = 0
             await self._s.commit()
 
@@ -141,7 +141,7 @@ class LightsailSearchService:
     async def mark_recheck(self, config_id: int) -> None:
         cfg = await self.get_config_by_id(config_id)
         if cfg:
-            cfg.last_recheck_at = datetime.now(timezone.utc)
+            cfg.last_recheck_at = datetime.utcnow()
             await self._s.commit()
 
     # ── static IPs ────────────────────────────────────────────────────────────
@@ -194,7 +194,7 @@ class LightsailSearchService:
         if row:
             row.is_working = is_working
             row.is_attached = is_attached
-            row.tested_at = datetime.now(timezone.utc)
+            row.tested_at = datetime.utcnow()
             await self._s.commit()
 
     async def set_ip_attached(self, static_ip_name: str, is_attached: bool) -> None:
