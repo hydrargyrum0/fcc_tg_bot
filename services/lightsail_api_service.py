@@ -273,7 +273,9 @@ async def detach_static_ip(
             client.detach_static_ip(staticIpName=static_ip_name)
         except botocore.exceptions.ClientError as e:
             code = e.response["Error"]["Code"]
-            if code not in ("NotFoundException", "InvalidInputException"):
+            # OperationFailureException = already not attached → fine
+            if code not in ("NotFoundException", "InvalidInputException",
+                            "OperationFailureException"):
                 raise
 
     await asyncio.to_thread(_detach)
