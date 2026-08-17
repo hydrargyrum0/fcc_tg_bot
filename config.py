@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     database_url: str
     redis_url: str
     superadmin_ids: list[int] = []
+    lightsail_instance_password: str
 
     @field_validator("superadmin_ids", mode="before")
     @classmethod

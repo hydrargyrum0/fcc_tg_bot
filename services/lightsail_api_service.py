@@ -13,21 +13,26 @@ from typing import Any
 import boto3
 import botocore.exceptions
 
+from config import settings
+
 logger = logging.getLogger(__name__)
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-INSTANCE_PASSWORD = "FCC-L1ghts@il-2024!"   # set via cloud-init on every instance
 PREFERRED_BLUEPRINTS = ["debian_13", "debian_12", "debian_11"]
 CHEAPEST_BUNDLE = "nano_3_0"                 # 0.5 GB RAM, 1 vCPU, $3.50/mo
 
-# cloud-init: enable SSH password auth + set root password
-_USER_DATA = f"""#!/bin/bash
-echo "root:{INSTANCE_PASSWORD}" | chpasswd
-sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-systemctl restart sshd 2>/dev/null || service sshd restart 2>/dev/null || true
-"""
+
+def _build_user_data() -> str:
+    """Build cloud-init script using the configured instance password."""
+    pw = settings.lightsail_instance_password
+    return (
+        "#!/bin/bash\n"
+        f'echo "root:{pw}" | chpasswd\n'
+        "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config\n"
+        "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config\n"
+        "systemctl restart sshd 2>/dev/null || service sshd restart 2>/dev/null || true\n"
+    )
 
 # All ports open (TCP + UDP full range + ICMP)
 _OPEN_PORTS = [
@@ -115,7 +120,7 @@ async def create_instance(
             availabilityZone=f"{region}a",
             blueprintId=blueprint_id,
             bundleId=CHEAPEST_BUNDLE,
-            userData=_USER_DATA,
+            userData=_build_user_data(),
         )
 
     await asyncio.to_thread(_create)
