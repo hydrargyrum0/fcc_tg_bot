@@ -48,6 +48,7 @@ from services.lightsail_api_service import (
     create_instance,
     delete_instance,
     detach_static_ip,
+    get_region_static_ips,
     instance_exists,
     open_all_ports,
     release_static_ip,
@@ -287,6 +288,10 @@ async def _search(config_id: int) -> None:  # noqa: C901
         f"Цель: {cfg.target_count} рабочих IP",
     )
 
+    # ── reconcile DB with actual AWS static IPs ──────────────────────────────
+    # (handles restart after crash — AWS IPs may exist that aren't in DB)
+    await _reconcile_static_ips(config_id, region, ak, sk)
+
     logger.info("Search %d [%s]: instance ready, starting IP search", config_id, region)
 
     # ── main search loop ─────────────────────────────────────────────────────
@@ -301,19 +306,23 @@ async def _search(config_id: int) -> None:  # noqa: C901
             all_ips = await svc.get_all_ips(config_id)
 
         working = [ip for ip in all_ips if ip.is_working is True]
-        non_working = [ip for ip in all_ips if ip.is_working is False]
+        # Rotation candidates: non-working OR untested (is_working=None, e.g. after restart)
+        rotation_candidates = [ip for ip in all_ips if ip.is_working is not True]
         total = len(all_ips)
 
         if len(working) >= target:
             break
 
         # ── determine which IP to test next ───────────────────────────────
+        new_ip_name: str
+        new_ip_addr: str
+
         if total < MAX_STATIC_IPS:
             new_name = f"fcc-{config_id}-{uuid.uuid4().hex[:6]}"
-            try:
-                ip_info = await allocate_static_ip(region, ak, sk, new_name)
-            except Exception as e:
-                logger.error("Search %d: failed to allocate static IP: %s", config_id, e)
+            ip_info = await _allocate_with_quota_recovery(
+                config_id, region, ak, sk, new_name
+            )
+            if ip_info is None:
                 await asyncio.sleep(30)
                 continue
             new_ip_name = ip_info["name"]
@@ -323,9 +332,10 @@ async def _search(config_id: int) -> None:  # noqa: C901
                     config_id, new_ip_name, new_ip_addr, is_attached=False
                 )
         else:
-            if not non_working:
+            if not rotation_candidates:
+                # All 5 slots are working — should not happen, but safety break
                 break
-            victim = non_working[0]
+            victim = rotation_candidates[0]
             try:
                 await detach_static_ip(region, ak, sk, victim.static_ip_name)
                 await release_static_ip(region, ak, sk, victim.static_ip_name)
@@ -336,10 +346,10 @@ async def _search(config_id: int) -> None:  # noqa: C901
                 await LightsailSearchService(session).delete_static_ip(victim.static_ip_name)
 
             new_name = f"fcc-{config_id}-{uuid.uuid4().hex[:6]}"
-            try:
-                ip_info = await allocate_static_ip(region, ak, sk, new_name)
-            except Exception as e:
-                logger.error("Search %d: failed to allocate static IP: %s", config_id, e)
+            ip_info = await _allocate_with_quota_recovery(
+                config_id, region, ak, sk, new_name
+            )
+            if ip_info is None:
                 await asyncio.sleep(30)
                 continue
             new_ip_name = ip_info["name"]
@@ -784,6 +794,93 @@ async def _find_one_replacement(
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+async def _reconcile_static_ips(
+    config_id: int, region: str, ak: str, sk: str
+) -> None:
+    """Sync lightsail_static_ips DB table with what's actually on AWS.
+
+    Adds IPs that exist on AWS but are missing from DB (e.g. after crash/restart).
+    Removes IPs from DB that no longer exist on AWS (e.g. manually released).
+    """
+    prefix = f"fcc-{config_id}-"
+    try:
+        aws_ips = await get_region_static_ips(region, ak, sk, name_prefix=prefix)
+    except Exception as e:
+        logger.warning("Reconcile %d: failed to list AWS static IPs: %s", config_id, e)
+        return
+
+    aws_by_name = {ip["name"]: ip for ip in aws_ips}
+
+    async with _session_factory() as session:
+        svc = LightsailSearchService(session)
+        db_ips = await svc.get_all_ips(config_id)
+        db_by_name = {ip.static_ip_name: ip for ip in db_ips}
+
+        # Add IPs present on AWS but missing from DB
+        for name, ip_info in aws_by_name.items():
+            if name not in db_by_name:
+                logger.info("Reconcile %d: adding missing IP %s (%s) to DB",
+                            config_id, name, ip_info["ipAddress"])
+                await svc.add_static_ip(
+                    config_id, name, ip_info["ipAddress"],
+                    is_attached=ip_info["isAttached"],
+                )
+
+        # Remove IPs present in DB but no longer on AWS
+        for name in db_by_name:
+            if name not in aws_by_name:
+                logger.info("Reconcile %d: removing stale IP %s from DB", config_id, name)
+                await svc.delete_static_ip(name)
+
+    logger.info("Reconcile %d: AWS=%d DB(before)=%d",
+                config_id, len(aws_by_name), len(db_by_name))
+
+
+async def _allocate_with_quota_recovery(
+    config_id: int, region: str, ak: str, sk: str, new_name: str
+) -> dict | None:
+    """Try to allocate a static IP. On quota error: reconcile + release non-working + retry."""
+    try:
+        return await allocate_static_ip(region, ak, sk, new_name)
+    except Exception as e:
+        if "maximum number of static IPs" not in str(e):
+            logger.error("Search %d: failed to allocate static IP: %s", config_id, e)
+            return None
+
+        logger.warning("Search %d: quota hit, reconciling and releasing non-working IPs", config_id)
+
+        # Sync DB with AWS first
+        await _reconcile_static_ips(config_id, region, ak, sk)
+
+        # Release all non-working and untested IPs
+        async with _session_factory() as session:
+            all_ips = await LightsailSearchService(session).get_all_ips(config_id)
+        candidates = [ip for ip in all_ips if ip.is_working is not True]
+
+        if not candidates:
+            logger.error("Search %d: quota hit but no releasable IPs found", config_id)
+            return None
+
+        for ip in candidates:
+            try:
+                await detach_static_ip(region, ak, sk, ip.static_ip_name)
+                await release_static_ip(region, ak, sk, ip.static_ip_name)
+                logger.info("Search %d: released %s (%s) to free quota",
+                            config_id, ip.static_ip_name, ip.ip_address)
+            except Exception as ex:
+                logger.warning("Search %d: could not release %s: %s",
+                               config_id, ip.static_ip_name, ex)
+            async with _session_factory() as session:
+                await LightsailSearchService(session).delete_static_ip(ip.static_ip_name)
+
+        # Retry allocation
+        try:
+            return await allocate_static_ip(region, ak, sk, new_name)
+        except Exception as e2:
+            logger.error("Search %d: still can't allocate after quota recovery: %s", config_id, e2)
+            return None
+
 
 def _is_ip_working(
     reachable: bool | None, loss_pct: float | None, elapsed: float

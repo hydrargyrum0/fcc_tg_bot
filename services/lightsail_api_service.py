@@ -299,6 +299,41 @@ async def release_static_ip(
     logger.info("Lightsail: released %s", static_ip_name)
 
 
+async def get_region_static_ips(
+    region: str,
+    access_key_id: str,
+    secret_access_key: str,
+    name_prefix: str = "",
+) -> list[dict]:
+    """List all static IPs allocated in this region, optionally filtered by name prefix.
+
+    Returns list of {"name": ..., "ipAddress": ..., "isAttached": bool}.
+    """
+    def _get():
+        client = _make_client(region, access_key_id, secret_access_key)
+        result = []
+        kwargs: dict = {}
+        while True:
+            resp = client.get_static_ips(**kwargs)
+            result.extend(resp.get("staticIps", []))
+            next_token = resp.get("nextPageToken")
+            if not next_token:
+                break
+            kwargs["pageToken"] = next_token
+        return result
+
+    ips = await asyncio.to_thread(_get)
+    return [
+        {
+            "name": ip["name"],
+            "ipAddress": ip["ipAddress"],
+            "isAttached": ip.get("isAttached", False),
+        }
+        for ip in ips
+        if not name_prefix or ip["name"].startswith(name_prefix)
+    ]
+
+
 async def get_static_ip_address(
     region: str,
     access_key_id: str,
