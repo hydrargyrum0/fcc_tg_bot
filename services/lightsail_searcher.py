@@ -65,6 +65,7 @@ WAKEUP_INTERVAL = 60
 LOSS_THRESHOLD_NORMAL = 0.0
 LOSS_THRESHOLD_RELAXED = 0.75
 RELAX_AFTER_SECONDS = 3600
+PING_CHECK_TIMEOUT = 120   # seconds to wait for Pingachock result before giving up
 
 # ── in-memory task registry ───────────────────────────────────────────────────
 
@@ -388,10 +389,17 @@ async def _search(config_id: int) -> None:  # noqa: C901
         # ── Pingachock check ───────────────────────────────────────────────
         elapsed = time.monotonic() - search_start
         try:
-            results = await distributed_ping_check(
-                api_url, api_key, [new_ip_addr], node_selector=node_selector,
+            results = await asyncio.wait_for(
+                distributed_ping_check(
+                    api_url, api_key, [new_ip_addr], node_selector=node_selector,
+                ),
+                timeout=PING_CHECK_TIMEOUT,
             )
             reachable, loss_pct, rtt_ms = results.get(new_ip_addr, (None, None, None))
+        except asyncio.TimeoutError:
+            logger.warning("Search %d: Pingachock check timed out for %s after %ds",
+                           config_id, new_ip_addr, PING_CHECK_TIMEOUT)
+            reachable, loss_pct, rtt_ms = None, None, None
         except Exception as e:
             logger.warning("Search %d: Pingachock error for %s: %s", config_id, new_ip_addr, e)
             reachable, loss_pct, rtt_ms = None, None, None
@@ -581,10 +589,16 @@ async def _recheck(config_id: int) -> None:  # noqa: C901
         await asyncio.sleep(ATTACH_WAIT_SECONDS)
 
         try:
-            results = await distributed_ping_check(
-                api_url, api_key, [ip_addr], node_selector=node_selector,
+            results = await asyncio.wait_for(
+                distributed_ping_check(
+                    api_url, api_key, [ip_addr], node_selector=node_selector,
+                ),
+                timeout=PING_CHECK_TIMEOUT,
             )
             reachable, loss_pct, _ = results.get(ip_addr, (None, None, None))
+        except asyncio.TimeoutError:
+            logger.warning("Recheck %d: Pingachock timed out for %s", config_id, ip_addr)
+            reachable, loss_pct = None, None
         except Exception as e:
             logger.warning("Recheck %d: Pingachock error for %s: %s", config_id, ip_addr, e)
             reachable, loss_pct = None, None
@@ -771,8 +785,11 @@ async def _find_one_replacement(
         await asyncio.sleep(ATTACH_WAIT_SECONDS)
 
         try:
-            results = await distributed_ping_check(
-                api_url, api_key, [new_ip_addr], node_selector=node_selector,
+            results = await asyncio.wait_for(
+                distributed_ping_check(
+                    api_url, api_key, [new_ip_addr], node_selector=node_selector,
+                ),
+                timeout=PING_CHECK_TIMEOUT,
             )
             reachable, loss_pct, _ = results.get(new_ip_addr, (None, None, None))
         except Exception:
