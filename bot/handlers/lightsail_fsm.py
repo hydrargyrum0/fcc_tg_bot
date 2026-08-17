@@ -68,7 +68,8 @@ async def _get_region_detail_text(
     account_tag: str,
 ) -> str:
     non_working = [ip for ip in all_ips if ip.is_working is False]
-    pending = [ip for ip in all_ips if ip.is_working is None]
+    # Currently attached IP = the one actually being tested right now
+    pending = [ip for ip in all_ips if ip.is_attached and ip.is_working is None]
 
     lines = [
         f"📍 <b>{cfg.region_display_name or cfg.region}</b>",
