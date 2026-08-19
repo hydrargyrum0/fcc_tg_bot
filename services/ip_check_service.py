@@ -165,17 +165,34 @@ async def poll_batch(
                     pending.discard(cid)
     else:
         # Single-check mode: poll each ID directly via GET /checks/{id}
+        # Track how long each check has been stuck on "pending" (not yet dispatched)
+        pending_since: dict[str, float] = {cid: loop.time() for cid in pending}
+        _STUCK_PENDING_TIMEOUT = 30.0  # give up if stuck on "pending" this long
         while pending and loop.time() < deadline:
             await asyncio.sleep(poll_interval)
+            now = loop.time()
             for cid in list(pending):
                 try:
                     data = await get_check(api_url, api_key, cid)
-                except PingachockAPIError:
+                except PingachockAPIError as e:
+                    logger.warning("poll_batch: get_check %s error: %s", cid, e)
                     continue
                 status = data.get("status", "")
+                if status:
+                    logger.info("poll_batch: check %s status=%s", cid, status)
                 statuses[cid] = status
                 if status in _TERMINAL:
                     pending.discard(cid)
+                elif status == "pending" and (now - pending_since.get(cid, now)) > _STUCK_PENDING_TIMEOUT:
+                    # Check created but never dispatched to any node — give up
+                    logger.warning(
+                        "poll_batch: check %s stuck on 'pending' for >%ds, treating as timed out",
+                        cid, _STUCK_PENDING_TIMEOUT,
+                    )
+                    pending.discard(cid)
+                elif status != "pending":
+                    # Status progressed beyond "pending" — reset the stuck timer
+                    pending_since.pop(cid, None)
 
     return statuses
 
@@ -443,6 +460,8 @@ async def distributed_ping_check(
     )
 
     logger.info("distributed_ping_check: create_check response keys=%s", list(resp.keys()))
+    if resp.get("warnings"):
+        logger.warning("distributed_ping_check: check created with warnings: %s", resp["warnings"])
 
     # Pingachock may return a batch response {"checks": [...]} or a single-check
     # response {"id": ..., "target": ...} when targets list has one item.
@@ -464,6 +483,12 @@ async def distributed_ping_check(
         return {ip: (None, None, None) for ip in ips}
 
     batch_id = resp.get("batch_id")
+    if not batch_id:
+        # Single-check response — log the initial status
+        logger.info(
+            "distributed_ping_check: single check %s initial status=%s",
+            next(iter(id_to_ip), "?"), resp.get("status"),
+        )
     await poll_batch(api_url, api_key, batch_id, set(id_to_ip.keys()), poll_timeout, poll_interval)
 
     # Fetch all check results in parallel — one HTTP request per check ID.
